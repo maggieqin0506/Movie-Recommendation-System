@@ -22,6 +22,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Cache
+.cache/
+
 # Data files (optional - uncomment if you don't want to track large CSV files)
 # *.csv
 

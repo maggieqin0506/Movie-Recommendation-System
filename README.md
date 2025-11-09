@@ -11,7 +11,7 @@ A collaborative filtering-based movie recommendation system that supports both u
   - Movie search functionality
   - Flexible rating system
 - **Efficient Processing**: Uses sparse matrices for handling large datasets
-- **Flexible**: Can work with sampled or full datasets
+- **Comprehensive**: Uses full dataset for best recommendation quality
 
 ## Installation
 
@@ -68,8 +68,8 @@ recommender = CollaborativeFilteringRecommender(
     method='user'  # or 'item' for item-based CF
 )
 
-# Load data (sample for faster processing)
-recommender.load_data(sample_size=100000)
+# Load data (full dataset)
+recommender.load_data()
 
 # Create user-item matrix
 recommender.create_user_item_matrix()
@@ -127,12 +127,6 @@ python movie_recommender.py --interactive
 
 # Run in interactive mode with item-based CF:
 python movie_recommender.py --interactive --method item
-
-# Run with custom sample size:
-python movie_recommender.py --interactive --sample-size 50000
-
-# Run with full dataset (no sampling):
-python movie_recommender.py --interactive --sample-size 0
 ```
 
 This interactive mode will:
@@ -212,12 +206,71 @@ similar_movies = recommender.get_similar_movies(movie_id=1, n=10)
 3. **Predict Ratings**: For each unrated movie, find similar movies the user rated and compute weighted average
 4. **Recommend**: Return top N movies with highest predicted ratings
 
+## Model Evaluation
+
+The system includes comprehensive evaluation metrics to assess recommendation quality:
+
+### Available Metrics
+
+1. **Rating Prediction Metrics**:
+   - **RMSE (Root Mean Square Error)**: Measures prediction accuracy (lower is better)
+   - **MAE (Mean Absolute Error)**: Average absolute difference between predicted and actual ratings (lower is better)
+
+2. **Ranking Metrics**:
+   - **Precision@K**: Fraction of recommended items that are relevant (higher is better)
+   - **Recall@K**: Fraction of relevant items that were recommended (higher is better)
+   - **F1@K**: Harmonic mean of Precision and Recall (higher is better)
+   - **NDCG@K**: Normalized Discounted Cumulative Gain - measures ranking quality with position discounting (higher is better)
+
+### Running Evaluation
+
+```bash
+# Evaluate user-based CF model
+python movie_recommender.py --evaluate
+
+# Evaluate item-based CF model
+python movie_recommender.py --evaluate --method item
+
+# Evaluate with custom test size
+python movie_recommender.py --evaluate --test-size 0.3
+```
+
+### Programmatic Evaluation
+
+```python
+from movie_recommender import CollaborativeFilteringRecommender
+
+# Initialize and load data
+recommender = CollaborativeFilteringRecommender(
+    ratings_file='ratings_full.csv',
+    movies_file='movies_clean.csv',
+    method='user'
+)
+recommender.load_data()
+
+# Split into train/test
+train_ratings, test_ratings = recommender.train_test_split(test_size=0.2)
+
+# Build model on training data
+recommender.ratings_df = train_ratings
+recommender.create_user_item_matrix()
+recommender.compute_similarity()
+
+# Evaluate on test set
+metrics = recommender.evaluate_model(test_ratings, k=50, top_k=10, threshold=4.0)
+
+print(f"RMSE: {metrics['rmse']:.4f}")
+print(f"Precision@10: {metrics['precision@k']:.4f}")
+print(f"Recall@10: {metrics['recall@k']:.4f}")
+```
+
 ## Performance Considerations
 
-- For large datasets (millions of ratings), use `sample_size` parameter to sample data
+- The system always uses the full dataset for best recommendation quality
 - The system uses sparse matrices for memory efficiency
 - Similarity computation can be time-consuming for very large datasets
 - Consider using approximate nearest neighbors for production systems
+- Evaluation can be slow for large test sets - consider sampling test data
 
 ## API Reference
 
@@ -225,13 +278,18 @@ similar_movies = recommender.get_similar_movies(movie_id=1, n=10)
 
 #### Methods
 
-- `load_data(sample_size=None)`: Load ratings and movies data
+- `load_data()`: Load ratings and movies data (full dataset)
 - `create_user_item_matrix()`: Create user-item rating matrix
 - `compute_similarity(n_neighbors=50)`: Compute similarity matrix
 - `recommend_movies(user_id, n_recommendations=10, k=50)`: Get movie recommendations
 - `get_user_ratings(user_id)`: Get all ratings for a user
 - `get_similar_users(user_id, n=10)`: Get users similar to a given user (user-based only)
 - `get_similar_movies(movie_id, n=10)`: Get movies similar to a given movie (item-based only)
+- `train_test_split(test_size=0.2, random_state=42)`: Split ratings into train/test sets
+- `evaluate_rating_prediction(test_ratings, k=50)`: Evaluate rating prediction (RMSE, MAE)
+- `evaluate_ranking(test_ratings, k=50, top_k=10, threshold=4.0)`: Evaluate ranking quality (Precision@K, Recall@K, NDCG@K)
+- `evaluate_model(test_ratings, k=50, top_k=10, threshold=4.0)`: Comprehensive model evaluation
+- `calculate_diversity(recommendations)`: Calculate diversity of recommendations
 
 ## Example Output
 
@@ -248,9 +306,11 @@ Top 10 Recommendations for User 1:
 The script supports several command-line arguments:
 
 - `--interactive` or `-i`: Run in interactive mode for new users
+- `--evaluate` or `-e`: Evaluate the model using train/test split and display metrics
 - `--method` or `-m`: Choose collaborative filtering method (`user` or `item`). In standard mode, omit to show both methods. In interactive mode, defaults to `user` if not specified.
 - `--user-id ID`: User ID to get recommendations for in standard mode (default: 1)
-- `--sample-size N`: Number of ratings to sample (default: 100000, use 0 for full dataset)
+- `--test-size FLOAT`: Proportion of data to use for testing in evaluation mode (default: 0.2)
+- `--threshold FLOAT`: Rating threshold to consider a movie as "relevant" in evaluation (default: 4.0)
 - `--help` or `-h`: Show help message
 
 ### Examples
@@ -274,11 +334,11 @@ python movie_recommender.py --interactive
 # Interactive mode with item-based CF
 python movie_recommender.py -i -m item
 
-# Interactive mode with full dataset
-python movie_recommender.py --interactive --sample-size 0
+# Evaluate the model
+python movie_recommender.py --evaluate
 
-# Standard mode with custom user and sample size
-python movie_recommender.py --user-id 100 --sample-size 50000
+# Evaluate with item-based CF and custom test size
+python movie_recommender.py --evaluate --method item --test-size 0.3
 ```
 
 ## Notes

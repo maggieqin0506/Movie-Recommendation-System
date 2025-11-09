@@ -5,12 +5,15 @@ Supports both User-Based and Item-Based Collaborative Filtering
 
 import pandas as pd
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, vstack
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Tuple, Dict, Set
 import warnings
 import ast
 import re
+import pickle
+import os
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
 
@@ -42,24 +45,105 @@ class CollaborativeFilteringRecommender:
         self.similarity_matrix = None
         self.user_ids = None
         self.movie_ids = None
+        self.user_item_matrix_sparse = None
+        self.user_to_idx = None
+        self.movie_to_idx = None
+        self.similarity_matrix_type = None  # 'dict' or 'dataframe'
         
-    def load_data(self, sample_size: int = None):
+    def _get_cache_path(self) -> str:
         """
-        Load ratings and movies data.
+        Get the cache file path for the similarity matrix.
+        
+        Returns:
+        --------
+        str
+            Path to the cache file
+        """
+        # Create cache directory if it doesn't exist
+        cache_dir = Path('.cache')
+        cache_dir.mkdir(exist_ok=True)
+        
+        # Generate cache filename based on ratings file and method
+        ratings_basename = Path(self.ratings_file).stem
+        cache_filename = f"similarity_{ratings_basename}_{self.method}.pkl"
+        return str(cache_dir / cache_filename)
+    
+    def _is_cache_valid(self, cache_path: str) -> bool:
+        """
+        Check if the cache file exists and is newer than the ratings file.
         
         Parameters:
         -----------
-        sample_size : int, optional
-            If provided, sample this many rows from ratings for faster processing
+        cache_path : str
+            Path to the cache file
+            
+        Returns:
+        --------
+        bool
+            True if cache is valid, False otherwise
+        """
+        if not os.path.exists(cache_path):
+            return False
+        
+        if not os.path.exists(self.ratings_file):
+            return False
+        
+        # Check if cache is newer than ratings file
+        cache_time = os.path.getmtime(cache_path)
+        ratings_time = os.path.getmtime(self.ratings_file)
+        
+        return cache_time >= ratings_time
+    
+    def _load_similarity_cache(self, cache_path: str) -> Tuple[bool, Dict]:
+        """
+        Load similarity matrix from cache.
+        
+        Parameters:
+        -----------
+        cache_path : str
+            Path to the cache file
+            
+        Returns:
+        --------
+        Tuple[bool, Dict]
+            (success, cached_data) - True if successfully loaded, False otherwise, and cached data
+        """
+        try:
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+            return True, cached_data
+        except Exception as e:
+            print(f"Failed to load cache: {e}")
+            return False, {}
+    
+    def _save_similarity_cache(self, cache_path: str):
+        """
+        Save similarity matrix to cache.
+        
+        Parameters:
+        -----------
+        cache_path : str
+            Path to the cache file
+        """
+        try:
+            cache_data = {
+                'similarity_matrix': self.similarity_matrix,
+                'user_ids': self.user_ids,
+                'movie_ids': self.movie_ids
+            }
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            print(f"Saved {self.method}-based similarity matrix to cache")
+        except Exception as e:
+            print(f"Failed to save cache: {e}")
+    
+    def load_data(self):
+        """
+        Load ratings and movies data (full dataset).
         """
         print("Loading ratings data...")
-        if sample_size:
-            # Sample data for faster processing on large datasets
-            self.ratings_df = pd.read_csv(self.ratings_file, nrows=sample_size)
-            print(f"Loaded {sample_size:,} ratings (sampled)")
-        else:
-            self.ratings_df = pd.read_csv(self.ratings_file)
-            print(f"Loaded {len(self.ratings_df):,} ratings")
+        self.ratings_df = pd.read_csv(self.ratings_file)
+        print(f"Loaded {len(self.ratings_df):,} ratings")
         
         print("Loading movies data...")
         self.movies_df = pd.read_csv(self.movies_file)
@@ -70,71 +154,287 @@ class CollaborativeFilteringRecommender:
         print(f"Filtered to {len(self.ratings_df):,} ratings after movie matching")
         
     def create_user_item_matrix(self):
-        """Create a user-item rating matrix."""
+        """Create a user-item rating matrix using sparse matrix directly."""
         print("Creating user-item matrix...")
         
-        # Create pivot table: users as rows, movies as columns
-        self.user_item_matrix = self.ratings_df.pivot_table(
-            index='userId',
-            columns='movieId',
-            values='rating',
-            fill_value=0
+        # Aggregate duplicate ratings (same user-movie pair) by taking mean
+        print("Aggregating duplicate ratings...")
+        ratings_agg = self.ratings_df.groupby(['userId', 'movieId'])['rating'].mean().reset_index()
+        
+        # Get unique user and movie IDs
+        unique_users = sorted(ratings_agg['userId'].unique())
+        unique_movies = sorted(ratings_agg['movieId'].unique())
+        
+        # Create mapping from IDs to indices
+        user_to_idx = {user_id: idx for idx, user_id in enumerate(unique_users)}
+        movie_to_idx = {movie_id: idx for idx, movie_id in enumerate(unique_movies)}
+        
+        # Store IDs for reference (in sorted order to match matrix indices)
+        self.user_ids = np.array(unique_users)
+        self.movie_ids = np.array(unique_movies)
+        
+        print(f"Matrix shape: {len(self.user_ids):,} users × {len(self.movie_ids):,} movies")
+        
+        # Build sparse matrix directly from aggregated ratings (more memory efficient)
+        print("Building sparse matrix from ratings...")
+        rows = []
+        cols = []
+        data = []
+        
+        # Process ratings in chunks to avoid memory issues
+        chunk_size = 1000000
+        total_ratings = len(ratings_agg)
+        
+        for start_idx in range(0, total_ratings, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_ratings)
+            chunk = ratings_agg.iloc[start_idx:end_idx]
+            
+            for _, row in chunk.iterrows():
+                user_id = row['userId']
+                movie_id = row['movieId']
+                rating = row['rating']
+                
+                rows.append(user_to_idx[user_id])
+                cols.append(movie_to_idx[movie_id])
+                data.append(rating)
+            
+            if (start_idx + chunk_size) % 5000000 == 0 or end_idx == total_ratings:
+                print(f"  Processed {end_idx:,}/{total_ratings:,} ratings ({100*end_idx/total_ratings:.1f}%)", end='\r')
+        
+        print()  # New line after progress
+        
+        # Create sparse matrix directly
+        self.user_item_matrix_sparse = csr_matrix(
+            (data, (rows, cols)),
+            shape=(len(self.user_ids), len(self.movie_ids))
         )
         
-        # Store user and movie IDs for reference
-        self.user_ids = self.user_item_matrix.index.values
-        self.movie_ids = self.user_item_matrix.columns.values
+        # Store mappings for later use
+        self.user_to_idx = user_to_idx
+        self.movie_to_idx = movie_to_idx
         
-        print(f"Matrix shape: {self.user_item_matrix.shape[0]:,} users × {self.user_item_matrix.shape[1]:,} movies")
-        
-        # Convert to sparse matrix for efficiency
-        self.user_item_matrix_sparse = csr_matrix(self.user_item_matrix.values)
-        
-    def compute_similarity(self, n_neighbors: int = 50):
+        print("Sparse matrix created successfully")
+    
+    def _get_user_rating(self, user_id: int, movie_id: int) -> float:
+        """Get rating for a specific user-movie pair from sparse matrix."""
+        if user_id not in self.user_to_idx or movie_id not in self.movie_to_idx:
+            return 0.0
+        user_idx = self.user_to_idx[user_id]
+        movie_idx = self.movie_to_idx[movie_id]
+        return float(self.user_item_matrix_sparse[user_idx, movie_idx])
+    
+    def _get_user_ratings_vector(self, user_id: int) -> np.ndarray:
+        """Get all ratings for a user as a numpy array."""
+        if user_id not in self.user_to_idx:
+            return np.zeros(len(self.movie_ids))
+        user_idx = self.user_to_idx[user_id]
+        return self.user_item_matrix_sparse[user_idx, :].toarray().flatten()
+    
+    def compute_similarity(self, n_neighbors: int = 50, use_cache: bool = True, 
+                         max_entities: int = 50000):
         """
         Compute similarity matrix based on the chosen method.
+        Uses cache if available and valid to avoid recomputation.
+        For very large datasets, samples entities for similarity computation.
         
         Parameters:
         -----------
         n_neighbors : int
             Number of nearest neighbors to consider (for efficiency)
+        use_cache : bool
+            Whether to use cached similarity matrix if available (default: True)
+        max_entities : int
+            Maximum number of users/items to use for similarity computation (default: 50000).
+            If dataset is larger, samples this many entities. Set to None to use all.
         """
-        print(f"Computing {self.method}-based similarity matrix...")
+        # Check cache first
+        if use_cache:
+            cache_path = self._get_cache_path()
+            if self._is_cache_valid(cache_path):
+                # Store current IDs for comparison
+                current_user_ids = self.user_ids.copy() if self.user_ids is not None else None
+                current_movie_ids = self.movie_ids.copy() if self.movie_ids is not None else None
+                
+                success, cached_data = self._load_similarity_cache(cache_path)
+                if success:
+                    # Verify that cached IDs match current IDs
+                    cached_user_ids = cached_data.get('user_ids')
+                    cached_movie_ids = cached_data.get('movie_ids')
+                    
+                    if (current_user_ids is not None and cached_user_ids is not None and
+                        len(current_user_ids) == len(cached_user_ids) and
+                        np.array_equal(current_user_ids, cached_user_ids) and
+                        current_movie_ids is not None and cached_movie_ids is not None and
+                        len(current_movie_ids) == len(cached_movie_ids) and
+                        np.array_equal(current_movie_ids, cached_movie_ids)):
+                        # IDs match, use cached similarity matrix
+                        self.similarity_matrix = cached_data['similarity_matrix']
+                        # Check if cached data is dict or DataFrame
+                        if isinstance(self.similarity_matrix, dict):
+                            self.similarity_matrix_type = 'dict'
+                        else:
+                            self.similarity_matrix_type = 'dataframe'
+                        print(f"Loaded {self.method}-based similarity matrix from cache")
+                        return
+                    # If IDs don't match, recompute
+                    print("Cache IDs don't match current data, recomputing...")
+        
+        # Compute similarity matrix (sparse, top-k only)
+        print(f"Computing {self.method}-based similarity matrix (top-{n_neighbors} neighbors)...")
         
         if self.method == 'user':
             # User-based: compute similarity between users
-            # Use cosine similarity on user vectors
-            similarity = cosine_similarity(self.user_item_matrix_sparse)
-            self.similarity_matrix = pd.DataFrame(
-                similarity,
-                index=self.user_ids,
-                columns=self.user_ids
-            )
-            print("User similarity matrix computed")
+            n_users = len(self.user_ids)
+            
+            # Sample users if dataset is too large
+            if max_entities and n_users > max_entities:
+                print(f"  Dataset has {n_users:,} users. Sampling {max_entities:,} users for similarity computation...")
+                np.random.seed(42)
+                sampled_indices = np.random.choice(n_users, size=max_entities, replace=False)
+                sampled_indices = np.sort(sampled_indices)  # Keep sorted for consistency
+                sampled_user_ids = self.user_ids[sampled_indices]
+                sampled_matrix = self.user_item_matrix_sparse[sampled_indices, :]
+                print(f"  Computing similarities for {max_entities:,} sampled users...")
+            else:
+                sampled_indices = np.arange(n_users)
+                sampled_user_ids = self.user_ids
+                sampled_matrix = self.user_item_matrix_sparse
+                print(f"  Computing similarities for {n_users:,} users...")
+            
+            # Initialize sparse similarity storage (dictionary of dictionaries)
+            similarity_dict = {}
+            
+            # Process in smaller batches to avoid memory issues
+            batch_size = 500  # Reduced batch size
+            n_sampled = len(sampled_user_ids)
+            total_batches = (n_sampled + batch_size - 1) // batch_size
+            
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, n_sampled)
+                batch_local_indices = np.arange(start_idx, end_idx)
+                batch_global_indices = sampled_indices[start_idx:end_idx]
+                batch_users = sampled_user_ids[start_idx:end_idx]
+                
+                # Compute similarity for this batch against sampled users only
+                batch_matrix = sampled_matrix[batch_local_indices, :]
+                batch_similarity = cosine_similarity(batch_matrix, sampled_matrix)
+                
+                # For each user in batch, keep only top-k similarities
+                for i, user_id in enumerate(batch_users):
+                    user_similarities = batch_similarity[i, :]
+                    # Get top-k (excluding self)
+                    top_k_local_indices = np.argsort(user_similarities)[::-1]
+                    # Exclude self and get top-k
+                    top_k_local_indices = [idx for idx in top_k_local_indices if idx != start_idx + i][:n_neighbors]
+                    top_k_similarities = user_similarities[top_k_local_indices]
+                    
+                    # Map back to global user IDs
+                    top_k_global_indices = sampled_indices[top_k_local_indices]
+                    
+                    # Store only non-zero similarities
+                    similarity_dict[user_id] = {
+                        self.user_ids[global_idx]: float(sim) 
+                        for global_idx, sim in zip(top_k_global_indices, top_k_similarities) 
+                        if sim > 0
+                    }
+                
+                if (batch_idx + 1) % 10 == 0 or batch_idx == total_batches - 1:
+                    print(f"  Progress: {batch_idx + 1}/{total_batches} batches ({100*(batch_idx+1)/total_batches:.1f}%)", end='\r')
+            
+            print()  # New line after progress
+            
+            # Store as dictionary for memory efficiency (only top-k per user)
+            # We'll create a wrapper DataFrame-like object for compatibility
+            self.similarity_matrix = similarity_dict
+            self.similarity_matrix_type = 'dict'
+            print("User similarity matrix computed (sparse, top-k, dict storage)")
             
         elif self.method == 'item':
             # Item-based: compute similarity between movies
-            # Transpose the matrix: movies as rows, users as columns
-            item_user_matrix = self.user_item_matrix.T
-            item_user_matrix_sparse = csr_matrix(item_user_matrix.values)
+            # Transpose the sparse matrix: movies as rows, users as columns
+            item_user_matrix_sparse = self.user_item_matrix_sparse.T
             
-            similarity = cosine_similarity(item_user_matrix_sparse)
-            self.similarity_matrix = pd.DataFrame(
-                similarity,
-                index=self.movie_ids,
-                columns=self.movie_ids
-            )
-            print("Item similarity matrix computed")
+            n_movies = len(self.movie_ids)
+            
+            # Sample movies if dataset is too large
+            if max_entities and n_movies > max_entities:
+                print(f"  Dataset has {n_movies:,} movies. Sampling {max_entities:,} movies for similarity computation...")
+                np.random.seed(42)
+                sampled_indices = np.random.choice(n_movies, size=max_entities, replace=False)
+                sampled_indices = np.sort(sampled_indices)  # Keep sorted for consistency
+                sampled_movie_ids = self.movie_ids[sampled_indices]
+                sampled_matrix = item_user_matrix_sparse[sampled_indices, :]
+                print(f"  Computing similarities for {max_entities:,} sampled movies...")
+            else:
+                sampled_indices = np.arange(n_movies)
+                sampled_movie_ids = self.movie_ids
+                sampled_matrix = item_user_matrix_sparse
+                print(f"  Computing similarities for {n_movies:,} movies...")
+            
+            # Initialize sparse similarity storage
+            similarity_dict = {}
+            
+            # Process in smaller batches to avoid memory issues
+            batch_size = 500  # Reduced batch size
+            n_sampled = len(sampled_movie_ids)
+            total_batches = (n_sampled + batch_size - 1) // batch_size
+            
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, n_sampled)
+                batch_local_indices = np.arange(start_idx, end_idx)
+                batch_global_indices = sampled_indices[start_idx:end_idx]
+                batch_movies = sampled_movie_ids[start_idx:end_idx]
+                
+                # Compute similarity for this batch against sampled movies only
+                batch_matrix = sampled_matrix[batch_local_indices, :]
+                batch_similarity = cosine_similarity(batch_matrix, sampled_matrix)
+                
+                # For each movie in batch, keep only top-k similarities
+                for i, movie_id in enumerate(batch_movies):
+                    movie_similarities = batch_similarity[i, :]
+                    # Get top-k (excluding self)
+                    top_k_local_indices = np.argsort(movie_similarities)[::-1]
+                    # Exclude self and get top-k
+                    top_k_local_indices = [idx for idx in top_k_local_indices if idx != start_idx + i][:n_neighbors]
+                    top_k_similarities = movie_similarities[top_k_local_indices]
+                    
+                    # Map back to global movie IDs
+                    top_k_global_indices = sampled_indices[top_k_local_indices]
+                    
+                    # Store only non-zero similarities
+                    similarity_dict[movie_id] = {
+                        self.movie_ids[global_idx]: float(sim) 
+                        for global_idx, sim in zip(top_k_global_indices, top_k_similarities) 
+                        if sim > 0
+                    }
+                
+                if (batch_idx + 1) % 10 == 0 or batch_idx == total_batches - 1:
+                    print(f"  Progress: {batch_idx + 1}/{total_batches} batches ({100*(batch_idx+1)/total_batches:.1f}%)", end='\r')
+            
+            print()  # New line after progress
+            
+            # Store as dictionary for memory efficiency (only top-k per movie)
+            self.similarity_matrix = similarity_dict
+            self.similarity_matrix_type = 'dict'
+            print("Item similarity matrix computed (sparse, top-k, dict storage)")
         else:
             raise ValueError("Method must be 'user' or 'item'")
+        
+        # Save to cache
+        if use_cache:
+            cache_path = self._get_cache_path()
+            self._save_similarity_cache(cache_path)
     
     def get_user_ratings(self, user_id: int) -> pd.Series:
         """Get all ratings for a specific user."""
         if user_id not in self.user_ids:
             raise ValueError(f"User {user_id} not found in the dataset")
         
-        user_ratings = self.user_item_matrix.loc[user_id]
-        return user_ratings[user_ratings > 0]  # Return only rated movies
+        ratings_vector = self._get_user_ratings_vector(user_id)
+        ratings_series = pd.Series(ratings_vector, index=self.movie_ids)
+        return ratings_series[ratings_series > 0]  # Return only rated movies
     
     def predict_rating_user_based(self, user_id: int, movie_id: int, k: int = 50) -> float:
         """
@@ -161,13 +461,43 @@ class CollaborativeFilteringRecommender:
             return 0.0
         
         # Get user's average rating
-        user_ratings = self.user_item_matrix.loc[user_id]
-        user_mean = user_ratings[user_ratings > 0].mean()
+        user_ratings_vector = self._get_user_ratings_vector(user_id)
+        user_mean = user_ratings_vector[user_ratings_vector > 0].mean()
         
         # Get similar users
-        user_similarities = self.similarity_matrix.loc[user_id].sort_values(ascending=False)
-        user_similarities = user_similarities[user_similarities.index != user_id]  # Exclude self
-        top_k_users = user_similarities.head(k)
+        # Note: If user_id is not in similarity matrix (wasn't sampled), 
+        # we compute similarity on-the-fly
+        if self.similarity_matrix_type == 'dict' and user_id not in self.similarity_matrix:
+            # Compute similarity for this user on-the-fly against sampled users
+            user_vector = self._get_user_ratings_vector(user_id).reshape(1, -1)
+            user_vector_sparse = csr_matrix(user_vector)
+            
+            # Get all users in similarity matrix (sampled users)
+            sampled_user_ids = list(self.similarity_matrix.keys())
+            sampled_indices = [self.user_to_idx[uid] for uid in sampled_user_ids if uid in self.user_to_idx]
+            if len(sampled_indices) == 0:
+                return user_mean  # No similar users found
+            
+            sampled_matrix = self.user_item_matrix_sparse[sampled_indices, :]
+            similarities = cosine_similarity(user_vector_sparse, sampled_matrix).flatten()
+            
+            # Get top-k
+            top_k_local_indices = np.argsort(similarities)[::-1][:k]
+            top_k_similarities = similarities[top_k_local_indices]
+            top_k_user_ids = [sampled_user_ids[idx] for idx in top_k_local_indices]
+            
+            # Create temporary similarity dict for this user
+            user_similarities_dict = {
+                uid: float(sim) for uid, sim in zip(top_k_user_ids, top_k_similarities) if sim > 0
+            }
+        else:
+            user_similarities = self._get_similarities(user_id).sort_values(ascending=False)
+            user_similarities = user_similarities[user_similarities.index != user_id]  # Exclude self
+            top_k_users = user_similarities.head(k)
+            user_similarities_dict = {uid: sim for uid, sim in top_k_users.items() if sim > 0}
+        
+        # Calculate weighted average using similarities
+        top_k_users = user_similarities_dict
         
         # Calculate weighted average
         numerator = 0
@@ -177,11 +507,11 @@ class CollaborativeFilteringRecommender:
             if similarity <= 0:
                 continue
                 
-            similar_user_rating = self.user_item_matrix.loc[similar_user_id, movie_id]
+            similar_user_rating = self._get_user_rating(similar_user_id, movie_id)
             
             if similar_user_rating > 0:
-                similar_user_mean = self.user_item_matrix.loc[similar_user_id]
-                similar_user_mean = similar_user_mean[similar_user_mean > 0].mean()
+                similar_user_ratings_vector = self._get_user_ratings_vector(similar_user_id)
+                similar_user_mean = similar_user_ratings_vector[similar_user_ratings_vector > 0].mean()
                 
                 numerator += similarity * (similar_user_rating - similar_user_mean)
                 denominator += abs(similarity)
@@ -220,22 +550,62 @@ class CollaborativeFilteringRecommender:
             return 0.0
         
         # Get user's ratings
-        user_ratings = self.user_item_matrix.loc[user_id]
-        user_rated_movies = user_ratings[user_ratings > 0]
+        user_ratings_vector = self._get_user_ratings_vector(user_id)
+        user_rated_movie_indices = np.where(user_ratings_vector > 0)[0]
+        user_rated_movie_ids = self.movie_ids[user_rated_movie_indices]
+        user_rated_movie_ratings = user_ratings_vector[user_rated_movie_indices]
         
-        if len(user_rated_movies) == 0:
+        if len(user_rated_movie_ids) == 0:
             return 0.0
         
         # Get similar movies
-        if movie_id not in self.similarity_matrix.index:
-            return 0.0
-        
-        movie_similarities = self.similarity_matrix.loc[movie_id].sort_values(ascending=False)
-        movie_similarities = movie_similarities[movie_similarities.index != movie_id]  # Exclude self
+        # Note: If movie_id is not in similarity matrix (wasn't sampled),
+        # we compute similarity on-the-fly
+        if self.similarity_matrix_type == 'dict' and movie_id not in self.similarity_matrix:
+            # Compute similarity for this movie on-the-fly against sampled movies
+            if movie_id not in self.movie_to_idx:
+                return 0.0
+            
+            movie_idx = self.movie_to_idx[movie_id]
+            movie_vector = self.user_item_matrix_sparse[:, movie_idx].T  # Transpose to row vector
+            
+            # Get all movies in similarity matrix (sampled movies)
+            sampled_movie_ids = list(self.similarity_matrix.keys())
+            sampled_indices = [self.movie_to_idx[mid] for mid in sampled_movie_ids if mid in self.movie_to_idx]
+            if len(sampled_indices) == 0:
+                return user_rated_movie_ratings.mean() if len(user_rated_movie_ratings) > 0 else 0.0
+            
+            sampled_matrix = self.user_item_matrix_sparse[:, sampled_indices].T
+            similarities = cosine_similarity(movie_vector, sampled_matrix).flatten()
+            
+            # Get top-k
+            top_k_local_indices = np.argsort(similarities)[::-1][:k]
+            top_k_similarities = similarities[top_k_local_indices]
+            top_k_movie_ids = [sampled_movie_ids[idx] for idx in top_k_local_indices]
+            
+            # Create temporary similarity dict for this movie
+            movie_similarities_dict = {
+                mid: float(sim) for mid, sim in zip(top_k_movie_ids, top_k_similarities) if sim > 0
+            }
+        else:
+            if self.similarity_matrix_type == 'dict':
+                if movie_id not in self.similarity_matrix:
+                    return 0.0
+            else:
+                if movie_id not in self.similarity_matrix.index:
+                    return 0.0
+            
+            movie_similarities = self._get_similarities(movie_id).sort_values(ascending=False)
+            movie_similarities = movie_similarities[movie_similarities.index != movie_id]  # Exclude self
+            movie_similarities_dict = {mid: sim for mid, sim in movie_similarities.head(k).items() if sim > 0}
         
         # Only consider movies the user has rated
-        rated_movie_similarities = movie_similarities[movie_similarities.index.isin(user_rated_movies.index)]
-        top_k_movies = rated_movie_similarities.head(k)
+        rated_movie_similarities = {
+            mid: sim for mid, sim in movie_similarities_dict.items() 
+            if mid in user_rated_movie_ids
+        }
+        # Sort by similarity and take top-k
+        top_k_movies = dict(sorted(rated_movie_similarities.items(), key=lambda x: x[1], reverse=True)[:k])
         
         # Calculate weighted average
         numerator = 0
@@ -245,13 +615,16 @@ class CollaborativeFilteringRecommender:
             if similarity <= 0:
                 continue
             
-            user_rating = user_rated_movies[similar_movie_id]
-            numerator += similarity * user_rating
-            denominator += abs(similarity)
+            # Find the rating for this movie
+            movie_idx = np.where(user_rated_movie_ids == similar_movie_id)[0]
+            if len(movie_idx) > 0:
+                user_rating = user_rated_movie_ratings[movie_idx[0]]
+                numerator += similarity * user_rating
+                denominator += abs(similarity)
         
         if denominator == 0:
             # Return mean of only rated movies (consistent with user-based CF)
-            return user_rated_movies.mean()
+            return user_rated_movie_ratings.mean() if len(user_rated_movie_ratings) > 0 else 0.0
         
         predicted_rating = numerator / denominator
         # Clamp rating between 0.5 and 5.0
@@ -342,10 +715,10 @@ class CollaborativeFilteringRecommender:
         if user_id not in self.user_ids:
             raise ValueError(f"User {user_id} not found")
         
-        user_similarities = self.similarity_matrix.loc[user_id].sort_values(ascending=False)
+        user_similarities = self._get_similarities(user_id).sort_values(ascending=False)
         user_similarities = user_similarities[user_similarities.index != user_id]
         
-        return [(uid, sim) for uid, sim in user_similarities.head(n).items()]
+        return [(uid, float(sim)) for uid, sim in user_similarities.head(n).items() if sim > 0]
     
     def get_similar_movies(self, movie_id: int, n: int = 10) -> List[Tuple[int, str, float]]:
         """
@@ -369,15 +742,16 @@ class CollaborativeFilteringRecommender:
         if movie_id not in self.movie_ids:
             raise ValueError(f"Movie {movie_id} not found")
         
-        movie_similarities = self.similarity_matrix.loc[movie_id].sort_values(ascending=False)
+        movie_similarities = self._get_similarities(movie_id).sort_values(ascending=False)
         movie_similarities = movie_similarities[movie_similarities.index != movie_id]
         
         similar_movies = []
         for similar_movie_id, similarity in movie_similarities.head(n).items():
-            movie_info = self.movies_df[self.movies_df['movieId'] == similar_movie_id]
-            if len(movie_info) > 0:
-                title = movie_info.iloc[0]['title']
-                similar_movies.append((similar_movie_id, title, similarity))
+            if similarity > 0:
+                movie_info = self.movies_df[self.movies_df['movieId'] == similar_movie_id]
+                if len(movie_info) > 0:
+                    title = movie_info.iloc[0]['title']
+                    similar_movies.append((similar_movie_id, title, float(similarity)))
         
         return similar_movies
     
@@ -398,30 +772,35 @@ class CollaborativeFilteringRecommender:
         # Generate new user ID (max existing + 1)
         new_user_id = int(self.user_ids.max()) + 1 if len(self.user_ids) > 0 else 1
         
-        # Create a new row for this user
-        new_user_row = pd.Series(0, index=self.movie_ids)
+        # Create new row data for sparse matrix
+        new_row_data = []
+        new_row_cols = []
         
         # Add ratings
         for movie_id, rating in user_ratings.items():
-            if movie_id in self.movie_ids:
-                new_user_row[movie_id] = rating
+            if movie_id in self.movie_to_idx:
+                new_row_cols.append(self.movie_to_idx[movie_id])
+                new_row_data.append(rating)
         
-        # Add to user-item matrix
-        self.user_item_matrix.loc[new_user_id] = new_user_row
+        # Create new row as sparse matrix
+        new_row = csr_matrix((new_row_data, ([0] * len(new_row_data), new_row_cols)), 
+                     shape=(1, len(self.movie_ids)))
         
-        # Update user_ids
-        self.user_ids = self.user_item_matrix.index.values
+        # Append new row to sparse matrix
+        self.user_item_matrix_sparse = vstack([self.user_item_matrix_sparse, new_row])
+        
+        # Update user IDs and mapping
+        self.user_ids = np.append(self.user_ids, new_user_id)
+        self.user_to_idx[new_user_id] = len(self.user_ids) - 1
         
         # Recompute similarity if needed (for user-based CF)
+        # Note: For large datasets, recomputing full similarity is expensive
+        # This is a simplified version - in production, you'd want to incrementally update
         if self.method == 'user':
-            # Recompute similarity matrix to include new user
-            self.user_item_matrix_sparse = csr_matrix(self.user_item_matrix.values)
-            similarity = cosine_similarity(self.user_item_matrix_sparse)
-            self.similarity_matrix = pd.DataFrame(
-                similarity,
-                index=self.user_ids,
-                columns=self.user_ids
-            )
+            # For now, we'll need to recompute (this is expensive for large datasets)
+            # In a production system, you'd want incremental updates
+            print("Warning: Recomputing similarity matrix for new user (this may take time)...")
+            self.compute_similarity(use_cache=False)
         
         return new_user_id
     
@@ -609,6 +988,364 @@ class CollaborativeFilteringRecommender:
             results.append((movie_id, title, genres))
         
         return results
+    
+    def evaluate_rating_prediction(self, test_ratings: pd.DataFrame, k: int = 50, 
+                                   max_samples: int = 10000) -> Dict[str, float]:
+        """
+        Evaluate rating prediction accuracy using RMSE and MAE.
+        
+        Parameters:
+        -----------
+        test_ratings : pd.DataFrame
+            DataFrame with columns: userId, movieId, rating
+        k : int
+            Number of neighbors to consider for prediction
+        max_samples : int
+            Maximum number of test ratings to evaluate (default: 10000)
+            
+        Returns:
+        --------
+        Dict[str, float]
+            Dictionary with 'rmse' and 'mae' metrics
+        """
+        predictions = []
+        actuals = []
+        
+        # Sample if too many test ratings
+        if len(test_ratings) > max_samples:
+            test_ratings = test_ratings.sample(n=max_samples, random_state=42).reset_index(drop=True)
+            print(f"  Sampling {max_samples:,} test ratings for evaluation...")
+        
+        total = len(test_ratings)
+        print(f"  Evaluating {total:,} rating predictions...")
+        
+        for idx, (_, row) in enumerate(test_ratings.iterrows(), 1):
+            if idx % 1000 == 0 or idx == total:
+                print(f"  Progress: {idx:,}/{total:,} ({100*idx/total:.1f}%)", end='\r')
+            
+            user_id = row['userId']
+            movie_id = row['movieId']
+            actual_rating = row['rating']
+            
+            if user_id not in self.user_ids or movie_id not in self.movie_ids:
+                continue
+            
+            # Predict rating
+            if self.method == 'user':
+                pred_rating = self.predict_rating_user_based(user_id, movie_id, k)
+            else:
+                pred_rating = self.predict_rating_item_based(user_id, movie_id, k)
+            
+            if pred_rating > 0:
+                predictions.append(pred_rating)
+                actuals.append(actual_rating)
+        
+        print()  # New line after progress
+        
+        if len(predictions) == 0:
+            return {'rmse': float('inf'), 'mae': float('inf'), 'n_samples': 0}
+        
+        # Calculate RMSE and MAE
+        predictions = np.array(predictions)
+        actuals = np.array(actuals)
+        
+        rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
+        mae = np.mean(np.abs(predictions - actuals))
+        
+        return {
+            'rmse': rmse,
+            'mae': mae,
+            'n_samples': len(predictions)
+        }
+    
+    def evaluate_ranking(self, test_ratings: pd.DataFrame, k: int = 50, 
+                        top_k: int = 10, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
+        """
+        Evaluate ranking quality using Precision@K, Recall@K, F1@K, and NDCG@K.
+        
+        Parameters:
+        -----------
+        test_ratings : pd.DataFrame
+            DataFrame with columns: userId, movieId, rating
+        k : int
+            Number of neighbors to consider for prediction
+        top_k : int
+            Number of top recommendations to consider
+        threshold : float
+            Rating threshold to consider a movie as "relevant" (default: 4.0)
+        max_users : int
+            Maximum number of users to evaluate (default: 100)
+            
+        Returns:
+        --------
+        Dict[str, float]
+            Dictionary with precision, recall, f1, and ndcg metrics
+        """
+        user_precisions = []
+        user_recalls = []
+        user_ndcgs = []
+        
+        # Group test ratings by user
+        user_groups = list(test_ratings.groupby('userId'))
+        
+        # Limit number of users to evaluate
+        if len(user_groups) > max_users:
+            import random
+            random.seed(42)
+            user_groups = random.sample(user_groups, max_users)
+            print(f"  Sampling {max_users} users for ranking evaluation...")
+        
+        total = len(user_groups)
+        print(f"  Evaluating ranking for {total} users...")
+        
+        for idx, (user_id, user_test) in enumerate(user_groups, 1):
+            if idx % 10 == 0 or idx == total:
+                print(f"  Progress: {idx}/{total} ({100*idx/total:.1f}%)", end='\r')
+            
+            if user_id not in self.user_ids:
+                continue
+            
+            # Get relevant movies (highly rated in test set)
+            relevant_movies = set(
+                user_test[user_test['rating'] >= threshold]['movieId'].values
+            )
+            
+            if len(relevant_movies) == 0:
+                continue
+            
+            # Get recommendations
+            try:
+                recommendations = self.recommend_movies(user_id, n_recommendations=top_k, k=k)
+                recommended_movies = set([rec[0] for rec in recommendations])
+            except:
+                continue
+            
+            # Calculate metrics
+            if len(recommended_movies) > 0:
+                # Precision@K: relevant items in recommendations / total recommendations
+                precision = len(relevant_movies & recommended_movies) / len(recommended_movies)
+                user_precisions.append(precision)
+                
+                # Recall@K: relevant items in recommendations / total relevant items
+                recall = len(relevant_movies & recommended_movies) / len(relevant_movies)
+                user_recalls.append(recall)
+                
+                # NDCG@K
+                ndcg = self._calculate_ndcg(recommendations, relevant_movies, top_k)
+                user_ndcgs.append(ndcg)
+        
+        print()  # New line after progress
+        
+        if len(user_precisions) == 0:
+            return {
+                'precision@k': 0.0,
+                'recall@k': 0.0,
+                'f1@k': 0.0,
+                'ndcg@k': 0.0,
+                'n_users': 0
+            }
+        
+        precision_avg = np.mean(user_precisions)
+        recall_avg = np.mean(user_recalls)
+        f1 = 2 * (precision_avg * recall_avg) / (precision_avg + recall_avg) if (precision_avg + recall_avg) > 0 else 0.0
+        ndcg_avg = np.mean(user_ndcgs)
+        
+        return {
+            'precision@k': precision_avg,
+            'recall@k': recall_avg,
+            'f1@k': f1,
+            'ndcg@k': ndcg_avg,
+            'n_users': len(user_precisions)
+        }
+    
+    def _calculate_ndcg(self, recommendations: List[Tuple[int, str, float]], 
+                       relevant_movies: Set[int], k: int) -> float:
+        """
+        Calculate Normalized Discounted Cumulative Gain at K.
+        
+        Parameters:
+        -----------
+        recommendations : List[Tuple[int, str, float]]
+            List of (movie_id, title, predicted_rating) tuples
+        relevant_movies : Set[int]
+            Set of relevant movie IDs
+        k : int
+            Number of recommendations to consider
+            
+        Returns:
+        --------
+        float
+            NDCG@K score
+        """
+        # DCG: sum of (relevance / log2(position + 1))
+        dcg = 0.0
+        for i, (movie_id, _, _) in enumerate(recommendations[:k], 1):
+            if movie_id in relevant_movies:
+                relevance = 1.0  # Binary relevance
+                dcg += relevance / np.log2(i + 1)
+        
+        # IDCG: ideal DCG (all relevant items at top)
+        n_relevant = min(len(relevant_movies), k)
+        idcg = sum(1.0 / np.log2(i + 2) for i in range(n_relevant))
+        
+        return dcg / idcg if idcg > 0 else 0.0
+    
+    def calculate_coverage(self, n_recommendations: int = 10, k: int = 50, 
+                          sample_users: int = 100) -> Dict[str, float]:
+        """
+        Calculate recommendation coverage (fraction of movies that can be recommended).
+        
+        Parameters:
+        -----------
+        n_recommendations : int
+            Number of recommendations per user
+        k : int
+            Number of neighbors to consider
+        sample_users : int
+            Number of users to sample for coverage calculation
+            
+        Returns:
+        --------
+        Dict[str, float]
+            Dictionary with coverage metrics
+        """
+        recommended_movies = set()
+        total_users = min(sample_users, len(self.user_ids))
+        
+        # Sample users
+        np.random.seed(42)
+        sampled_user_ids = np.random.choice(self.user_ids, size=total_users, replace=False)
+        
+        for idx, user_id in enumerate(sampled_user_ids, 1):
+            if idx % 10 == 0 or idx == total_users:
+                print(f"  Progress: {idx}/{total_users} ({100*idx/total_users:.1f}%)", end='\r')
+            try:
+                recommendations = self.recommend_movies(user_id, n_recommendations=n_recommendations, k=k)
+                recommended_movies.update([rec[0] for rec in recommendations])
+            except:
+                continue
+        
+        if total_users > 0:
+            print()  # New line after progress
+        
+        coverage = len(recommended_movies) / len(self.movie_ids) if len(self.movie_ids) > 0 else 0.0
+        
+        return {
+            'coverage': coverage,
+            'unique_movies_recommended': len(recommended_movies),
+            'total_movies': len(self.movie_ids),
+            'n_users_sampled': total_users
+        }
+    
+    def calculate_diversity(self, recommendations: List[Tuple[int, str, float]]) -> float:
+        """
+        Calculate diversity of recommendations using cosine similarity between movies.
+        Lower similarity = higher diversity.
+        
+        Parameters:
+        -----------
+        recommendations : List[Tuple[int, str, float]]
+            List of (movie_id, title, predicted_rating) tuples
+            
+        Returns:
+        --------
+        float
+            Diversity score (1 - average similarity)
+        """
+        if len(recommendations) < 2:
+            return 0.0
+        
+        movie_ids = [rec[0] for rec in recommendations]
+        
+        # Get movie vectors from user-item matrix (item-based) or similarity matrix
+        if self.method == 'item' and hasattr(self, 'similarity_matrix'):
+            # Use item similarity matrix
+            similarities = []
+            for i, movie_id1 in enumerate(movie_ids):
+                for movie_id2 in movie_ids[i+1:]:
+                    sim = self._get_similarity(movie_id1, movie_id2)
+                    if sim > 0:
+                        similarities.append(sim)
+            
+            if len(similarities) > 0:
+                avg_similarity = np.mean(similarities)
+                return 1.0 - avg_similarity  # Diversity = 1 - similarity
+        
+        return 0.5  # Default if can't calculate
+    
+    def train_test_split(self, test_size: float = 0.2, random_state: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Split ratings into training and test sets.
+        
+        Parameters:
+        -----------
+        test_size : float
+            Proportion of ratings to use for testing (default: 0.2)
+        random_state : int
+            Random seed for reproducibility
+            
+        Returns:
+        --------
+        Tuple[pd.DataFrame, pd.DataFrame]
+            (train_ratings, test_ratings) DataFrames
+        """
+        if self.ratings_df is None:
+            raise ValueError("Data must be loaded first. Call load_data() before train_test_split().")
+        
+        # Shuffle ratings
+        ratings_shuffled = self.ratings_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+        
+        # Split by user to ensure users appear in both sets
+        n_test = int(len(ratings_shuffled) * test_size)
+        test_ratings = ratings_shuffled.head(n_test)
+        train_ratings = ratings_shuffled.tail(len(ratings_shuffled) - n_test)
+        
+        return train_ratings, test_ratings
+    
+    def evaluate_model(self, test_ratings: pd.DataFrame, k: int = 50, 
+                      top_k: int = 10, threshold: float = 4.0,
+                      max_samples: int = 10000, max_users: int = 100) -> Dict[str, float]:
+        """
+        Comprehensive model evaluation combining rating prediction and ranking metrics.
+        
+        Parameters:
+        -----------
+        test_ratings : pd.DataFrame
+            DataFrame with columns: userId, movieId, rating
+        k : int
+            Number of neighbors to consider for prediction
+        top_k : int
+            Number of top recommendations to consider for ranking metrics
+        threshold : float
+            Rating threshold to consider a movie as "relevant" (default: 4.0)
+        max_samples : int
+            Maximum number of test ratings to evaluate (default: 10000)
+        max_users : int
+            Maximum number of users to evaluate for ranking (default: 100)
+            
+        Returns:
+        --------
+        Dict[str, float]
+            Dictionary with all evaluation metrics
+        """
+        print("Evaluating model...")
+        print("=" * 60)
+        
+        # Rating prediction metrics
+        print("\n[1/2] Calculating rating prediction metrics (RMSE, MAE)...")
+        rating_metrics = self.evaluate_rating_prediction(test_ratings, k=k, max_samples=max_samples)
+        
+        # Ranking metrics
+        print("\n[2/2] Calculating ranking metrics (Precision@K, Recall@K, NDCG@K)...")
+        ranking_metrics = self.evaluate_ranking(test_ratings, k=k, top_k=top_k, threshold=threshold, max_users=max_users)
+        
+        # Combine all metrics
+        all_metrics = {
+            **rating_metrics,
+            **ranking_metrics
+        }
+        
+        return all_metrics
 
 
 def interactive_new_user_mode(recommender):
@@ -841,7 +1578,7 @@ def interactive_new_user_mode(recommender):
     print("=" * 60)
 
 
-def main(user_id: int = 1, sample_size: int = 100000, method: str = None):
+def main(user_id: int = 1, method: str = None):
     """
     Example usage of the Collaborative Filtering Recommender.
     
@@ -849,8 +1586,6 @@ def main(user_id: int = 1, sample_size: int = 100000, method: str = None):
     -----------
     user_id : int
         User ID to get recommendations for (default: 1)
-    sample_size : int
-        Number of ratings to sample (0 for full dataset)
     method : str, optional
         'user' for user-based CF, 'item' for item-based CF, or None for both (default: None)
     """
@@ -873,10 +1608,7 @@ def main(user_id: int = 1, sample_size: int = 100000, method: str = None):
         )
         
         # Load data
-        if sample_size > 0:
-            recommender.load_data(sample_size=sample_size)
-        else:
-            recommender.load_data()
+        recommender.load_data()
         
         # Create user-item matrix
         recommender.create_user_item_matrix()
@@ -948,7 +1680,77 @@ def main(user_id: int = 1, sample_size: int = 100000, method: str = None):
             print("\n")
 
 
-def main_interactive(method: str = 'user', sample_size: int = 100000):
+def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float = 4.0):
+    """
+    Evaluate the recommendation model using train/test split.
+    
+    Parameters:
+    -----------
+    method : str
+        'user' for user-based CF or 'item' for item-based CF
+    test_size : float
+        Proportion of data to use for testing (default: 0.2)
+    threshold : float
+        Rating threshold to consider a movie as "relevant" (default: 4.0)
+    """
+    method_name = "User-Based" if method == 'user' else "Item-Based"
+    print("=" * 60)
+    print(f"Model Evaluation - {method_name} Collaborative Filtering")
+    print("=" * 60)
+    
+    # Initialize recommender
+    recommender = CollaborativeFilteringRecommender(
+        ratings_file='ratings_full.csv',
+        movies_file='movies_clean.csv',
+        method=method
+    )
+    
+    # Load data
+    print("\nLoading data...")
+    recommender.load_data()
+    
+    # Split into train and test
+    print(f"\nSplitting data into train/test sets (test_size={test_size})...")
+    train_ratings, test_ratings = recommender.train_test_split(test_size=test_size)
+    
+    print(f"Training set: {len(train_ratings):,} ratings")
+    print(f"Test set: {len(test_ratings):,} ratings")
+    
+    # Use training data to build the model
+    print("\nBuilding model on training data...")
+    # Save original ratings
+    original_ratings = recommender.ratings_df.copy()
+    # Replace with training data
+    recommender.ratings_df = train_ratings
+    # Rebuild matrices with training data
+    recommender.create_user_item_matrix()
+    recommender.compute_similarity()
+    
+    # Evaluate on test set
+    print("\n" + "=" * 60)
+    print(f"Using relevance threshold: rating >= {threshold}")
+    metrics = recommender.evaluate_model(test_ratings, k=50, top_k=10, threshold=threshold)
+    
+    # Display results
+    print("\n" + "=" * 60)
+    print("Evaluation Results")
+    print("=" * 60)
+    print("\nRating Prediction Metrics:")
+    print(f"  RMSE (Root Mean Square Error): {metrics['rmse']:.4f}")
+    print(f"  MAE (Mean Absolute Error):     {metrics['mae']:.4f}")
+    print(f"  Number of predictions:         {metrics['n_samples']:,}")
+    
+    print("\nRanking Metrics (Top-10 Recommendations):")
+    print(f"  Precision@10: {metrics['precision@k']:.4f}")
+    print(f"  Recall@10:    {metrics['recall@k']:.4f}")
+    print(f"  F1@10:        {metrics['f1@k']:.4f}")
+    print(f"  NDCG@10:      {metrics['ndcg@k']:.4f}")
+    print(f"  Users evaluated: {metrics['n_users']:,}")
+    
+    print("=" * 60)
+
+
+def main_interactive(method: str = 'user'):
     """
     Interactive mode for new users.
     
@@ -956,8 +1758,6 @@ def main_interactive(method: str = 'user', sample_size: int = 100000):
     -----------
     method : str
         'user' for user-based CF or 'item' for item-based CF
-    sample_size : int
-        Number of ratings to sample (0 for full dataset)
     """
     method_name = "User-Based" if method == 'user' else "Item-Based"
     print("=" * 60)
@@ -973,10 +1773,7 @@ def main_interactive(method: str = 'user', sample_size: int = 100000):
     
     # Load data
     print("\nLoading data...")
-    if sample_size > 0:
-        recommender.load_data(sample_size=sample_size)
-    else:
-        recommender.load_data()  # Full dataset
+    recommender.load_data()
     
     # Create user-item matrix
     recommender.create_user_item_matrix()
@@ -1003,14 +1800,17 @@ Examples:
   # Run standard mode for a specific user
   python movie_recommender.py --user-id 42
   
+  # Evaluate the model
+  python movie_recommender.py --evaluate
+  
+  # Evaluate with item-based CF
+  python movie_recommender.py --evaluate --method item
+  
   # Run interactive mode with user-based CF (default)
   python movie_recommender.py --interactive
   
   # Run interactive mode with item-based CF
   python movie_recommender.py --interactive --method item
-  
-  # Run with custom sample size and user ID
-  python movie_recommender.py --user-id 100 --sample-size 50000
         """
     )
     
@@ -1018,6 +1818,12 @@ Examples:
         '--interactive', '-i',
         action='store_true',
         help='Run in interactive mode for new users'
+    )
+    
+    parser.add_argument(
+        '--evaluate', '-e',
+        action='store_true',
+        help='Evaluate the model using train/test split and display metrics'
     )
     
     parser.add_argument(
@@ -1029,14 +1835,6 @@ Examples:
     )
     
     parser.add_argument(
-        '--sample-size',
-        type=int,
-        default=100000,
-        metavar='N',
-        help='Number of ratings to sample for faster processing (default: 100000, use 0 for full dataset)'
-    )
-    
-    parser.add_argument(
         '--user-id',
         type=int,
         default=1,
@@ -1044,14 +1842,34 @@ Examples:
         help='User ID to get recommendations for in standard mode (default: 1)'
     )
     
+    parser.add_argument(
+        '--test-size',
+        type=float,
+        default=0.2,
+        metavar='FLOAT',
+        help='Proportion of data to use for testing in evaluation mode (default: 0.2)'
+    )
+    
+    parser.add_argument(
+        '--threshold',
+        type=float,
+        default=4.0,
+        metavar='FLOAT',
+        help='Rating threshold to consider a movie as "relevant" in evaluation (default: 4.0)'
+    )
+    
     args = parser.parse_args()
     
-    # Check if user wants interactive mode
-    if args.interactive:
-        # For interactive mode, default to 'user' if not specified
+    # Check which mode to run
+    if args.evaluate:
+        # Evaluation mode
         method = args.method if args.method else 'user'
-        main_interactive(method=method, sample_size=args.sample_size)
+        main_evaluate(method=method, test_size=args.test_size, threshold=args.threshold)
+    elif args.interactive:
+        # Interactive mode
+        method = args.method if args.method else 'user'
+        main_interactive(method=method)
     else:
-        # In standard mode, if method is specified, use it; otherwise show both
-        main(user_id=args.user_id, sample_size=args.sample_size, method=args.method)
+        # Standard mode
+        main(user_id=args.user_id, method=args.method)
 
