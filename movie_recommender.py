@@ -149,6 +149,13 @@ class CollaborativeFilteringRecommender:
         self.movies_df = pd.read_csv(self.movies_file)
         print(f"Loaded {len(self.movies_df):,} movies")
         
+        # Use year_filled instead of year (if year_filled exists)
+        if 'year_filled' in self.movies_df.columns:
+            if 'year' in self.movies_df.columns:
+                # Drop the original year column and rename year_filled to year
+                self.movies_df = self.movies_df.drop(columns=['year'])
+            self.movies_df = self.movies_df.rename(columns={'year_filled': 'year'})
+        
         # Filter ratings to only include movies that exist in movies_df
         self.ratings_df = self.ratings_df[self.ratings_df['movieId'].isin(self.movies_df['movieId'])]
         print(f"Filtered to {len(self.ratings_df):,} ratings after movie matching")
