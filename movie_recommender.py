@@ -23,7 +23,7 @@ class CollaborativeFilteringRecommender:
     Supports both user-based and item-based filtering approaches.
     """
     
-    def __init__(self, ratings_file: str, movies_file: str, method: str = 'user'):
+    def __init__(self, ratings_file: str, movies_file: str, method: str = 'user', similarity_threshold: float = 0.3):
         """
         Initialize the recommender system.
         
@@ -35,10 +35,13 @@ class CollaborativeFilteringRecommender:
             Path to the movies CSV file
         method : str
             'user' for user-based CF or 'item' for item-based CF
+        similarity_threshold : float
+            Minimum similarity value to consider (default: 0.3). Similarities below this threshold are ignored.
         """
         self.method = method
         self.ratings_file = ratings_file
         self.movies_file = movies_file
+        self.similarity_threshold = similarity_threshold
         self.ratings_df = None
         self.movies_df = None
         self.user_item_matrix = None
@@ -50,9 +53,14 @@ class CollaborativeFilteringRecommender:
         self.movie_to_idx = None
         self.similarity_matrix_type = None  # 'dict' or 'dataframe'
         
-    def _get_cache_path(self) -> str:
+    def _get_cache_path(self, cache_type: str = 'similarity') -> str:
         """
-        Get the cache file path for the similarity matrix.
+        Get the cache file path for the similarity matrix or full model.
+        
+        Parameters:
+        -----------
+        cache_type : str
+            Type of cache: 'similarity' for similarity matrix only, 'model' for full model
         
         Returns:
         --------
@@ -63,19 +71,22 @@ class CollaborativeFilteringRecommender:
         cache_dir = Path('.cache')
         cache_dir.mkdir(exist_ok=True)
         
-        # Generate cache filename based on ratings file and method
+        # Generate cache filename based on ratings file, method, and cache type
         ratings_basename = Path(self.ratings_file).stem
-        cache_filename = f"similarity_{ratings_basename}_{self.method}.pkl"
+        movies_basename = Path(self.movies_file).stem
+        cache_filename = f"{cache_type}_{ratings_basename}_{movies_basename}_{self.method}.pkl"
         return str(cache_dir / cache_filename)
     
-    def _is_cache_valid(self, cache_path: str) -> bool:
+    def _is_cache_valid(self, cache_path: str, check_movies: bool = False) -> bool:
         """
-        Check if the cache file exists and is newer than the ratings file.
+        Check if the cache file exists and is newer than the data files.
         
         Parameters:
         -----------
         cache_path : str
             Path to the cache file
+        check_movies : bool
+            If True, also check movies file timestamp (for full model cache)
             
         Returns:
         --------
@@ -92,7 +103,18 @@ class CollaborativeFilteringRecommender:
         cache_time = os.path.getmtime(cache_path)
         ratings_time = os.path.getmtime(self.ratings_file)
         
-        return cache_time >= ratings_time
+        if cache_time < ratings_time:
+            return False
+        
+        # If checking movies file (for full model cache)
+        if check_movies:
+            if not os.path.exists(self.movies_file):
+                return False
+            movies_time = os.path.getmtime(self.movies_file)
+            if cache_time < movies_time:
+                return False
+        
+        return True
     
     def _load_similarity_cache(self, cache_path: str) -> Tuple[bool, Dict]:
         """
@@ -137,9 +159,125 @@ class CollaborativeFilteringRecommender:
         except Exception as e:
             print(f"Failed to save cache: {e}")
     
-    def load_data(self):
+    def _save_model_cache(self, cache_path: str):
+        """
+        Save full model state to cache (user-item matrix, mappings, similarity, etc.).
+        
+        Parameters:
+        -----------
+        cache_path : str
+            Path to the cache file
+        """
+        try:
+            cache_data = {
+                'user_item_matrix_sparse': self.user_item_matrix_sparse,
+                'user_to_idx': self.user_to_idx,
+                'movie_to_idx': self.movie_to_idx,
+                'user_ids': self.user_ids,
+                'movie_ids': self.movie_ids,
+                'similarity_matrix': self.similarity_matrix,
+                'similarity_matrix_type': self.similarity_matrix_type,
+                'movies_df': self.movies_df  # Save movies_df for recommendations
+            }
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            print(f"Saved full {self.method}-based model to cache")
+        except Exception as e:
+            print(f"Failed to save model cache: {e}")
+    
+    def _load_model_cache(self, cache_path: str) -> Tuple[bool, Dict]:
+        """
+        Load full model state from cache.
+        
+        Parameters:
+        -----------
+        cache_path : str
+            Path to the cache file
+            
+        Returns:
+        --------
+        Tuple[bool, Dict]
+            (success, cached_data) - True if successfully loaded, False otherwise, and cached data
+        """
+        try:
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+            return True, cached_data
+        except Exception as e:
+            print(f"Failed to load model cache: {e}")
+            return False, {}
+    
+    def load_model(self, min_year: int = 2015, use_cache: bool = True) -> bool:
+        """
+        Load data and build model, using cache if available to skip retraining.
+        
+        Parameters:
+        -----------
+        min_year : int
+            Minimum year to include movies (default: 2015)
+        use_cache : bool
+            Whether to use cached model if available (default: True)
+            
+        Returns:
+        --------
+        bool
+            True if model was loaded from cache, False if it was rebuilt
+        """
+        # Check for full model cache first
+        if use_cache:
+            model_cache_path = self._get_cache_path('model')
+            if self._is_cache_valid(model_cache_path, check_movies=True):
+                success, cached_data = self._load_model_cache(model_cache_path)
+                if success:
+                    # Restore all model state
+                    self.user_item_matrix_sparse = cached_data.get('user_item_matrix_sparse')
+                    self.user_to_idx = cached_data.get('user_to_idx')
+                    self.movie_to_idx = cached_data.get('movie_to_idx')
+                    self.user_ids = cached_data.get('user_ids')
+                    self.movie_ids = cached_data.get('movie_ids')
+                    self.similarity_matrix = cached_data.get('similarity_matrix')
+                    self.similarity_matrix_type = cached_data.get('similarity_matrix_type')
+                    self.movies_df = cached_data.get('movies_df')
+                    
+                    # Verify critical components exist
+                    if (self.user_item_matrix_sparse is not None and 
+                        self.user_to_idx is not None and 
+                        self.movie_to_idx is not None and
+                        self.similarity_matrix is not None):
+                        # Always load ratings_df for methods that need it (like get_movies_by_genres)
+                        # This is fast since we're just reading the CSV
+                        if self.ratings_df is None:
+                            print("Loading ratings data for additional features...")
+                            self.ratings_df = pd.read_csv(self.ratings_file)
+                            # Filter to match cached movies
+                            self.ratings_df = self.ratings_df[self.ratings_df['movieId'].isin(self.movie_ids)]
+                        
+                        print(f"Loaded full {self.method}-based model from cache (skipping retraining)")
+                        return True
+                    else:
+                        print("Cached model is incomplete, rebuilding...")
+        
+        # If cache not available or invalid, build model from scratch
+        print("Building model from scratch...")
+        self.load_data(min_year=min_year)
+        self.create_user_item_matrix()
+        self.compute_similarity()
+        
+        # Save full model to cache
+        if use_cache:
+            model_cache_path = self._get_cache_path('model')
+            self._save_model_cache(model_cache_path)
+        
+        return False
+    
+    def load_data(self, min_year: int = 2015):
         """
         Load ratings and movies data (full dataset).
+        
+        Parameters:
+        -----------
+        min_year : int
+            Minimum year to include movies (default: 2015). Only movies released after this year will be included.
         """
         print("Loading ratings data...")
         self.ratings_df = pd.read_csv(self.ratings_file)
@@ -156,9 +294,21 @@ class CollaborativeFilteringRecommender:
                 self.movies_df = self.movies_df.drop(columns=['year'])
             self.movies_df = self.movies_df.rename(columns={'year_filled': 'year'})
         
+        # Filter movies by year (only movies released after min_year)
+        if 'year' in self.movies_df.columns:
+            initial_count = len(self.movies_df)
+            # Convert year to numeric, handling any non-numeric values
+            self.movies_df['year'] = pd.to_numeric(self.movies_df['year'], errors='coerce')
+            # Filter movies released after min_year
+            self.movies_df = self.movies_df[self.movies_df['year'] > min_year]
+            print(f"Filtered to {len(self.movies_df):,} movies released after {min_year} (from {initial_count:,} total)")
+        else:
+            print("Warning: 'year' column not found, skipping year-based filtering")
+        
         # Filter ratings to only include movies that exist in movies_df
+        initial_ratings_count = len(self.ratings_df)
         self.ratings_df = self.ratings_df[self.ratings_df['movieId'].isin(self.movies_df['movieId'])]
-        print(f"Filtered to {len(self.ratings_df):,} ratings after movie matching")
+        print(f"Filtered to {len(self.ratings_df):,} ratings after movie matching (from {initial_ratings_count:,} total)")
         
     def create_user_item_matrix(self):
         """Create a user-item rating matrix using sparse matrix directly."""
@@ -237,12 +387,47 @@ class CollaborativeFilteringRecommender:
         user_idx = self.user_to_idx[user_id]
         return self.user_item_matrix_sparse[user_idx, :].toarray().flatten()
     
-    def compute_similarity(self, n_neighbors: int = 50, use_cache: bool = True, 
-                         max_entities: int = 50000):
+    def _get_similarities(self, entity_id: int) -> pd.Series:
+        """
+        Get similarities for a user or movie from the similarity matrix.
+        
+        Parameters:
+        -----------
+        entity_id : int
+            User ID (for user-based) or Movie ID (for item-based)
+            
+        Returns:
+        --------
+        pd.Series
+            Series with entity_id as index and similarity scores as values
+        """
+        if self.similarity_matrix is None:
+            return pd.Series(dtype=float)
+        
+        if self.similarity_matrix_type == 'dict':
+            # Similarity matrix is stored as dict of dicts
+            if entity_id in self.similarity_matrix:
+                # Return similarities as a Series
+                similarities_dict = self.similarity_matrix[entity_id]
+                if isinstance(similarities_dict, dict):
+                    return pd.Series(similarities_dict)
+                else:
+                    return pd.Series(dtype=float)
+            else:
+                # Entity not in similarity matrix (wasn't sampled or is new)
+                return pd.Series(dtype=float)
+        else:
+            # Similarity matrix is a DataFrame (legacy format)
+            if entity_id in self.similarity_matrix.index:
+                return self.similarity_matrix.loc[entity_id]
+            else:
+                return pd.Series(dtype=float)
+    
+    def compute_similarity(self, n_neighbors: int = 10, use_cache: bool = True, 
+                         use_mean_centering: bool = False):
         """
         Compute similarity matrix based on the chosen method.
         Uses cache if available and valid to avoid recomputation.
-        For very large datasets, samples entities for similarity computation.
         
         Parameters:
         -----------
@@ -250,9 +435,9 @@ class CollaborativeFilteringRecommender:
             Number of nearest neighbors to consider (for efficiency)
         use_cache : bool
             Whether to use cached similarity matrix if available (default: True)
-        max_entities : int
-            Maximum number of users/items to use for similarity computation (default: 50000).
-            If dataset is larger, samples this many entities. Set to None to use all.
+        use_mean_centering : bool
+            Whether to mean-center ratings before computing similarity (default: False).
+            Improves accuracy but significantly slower for large datasets.
         """
         # Check cache first
         if use_cache:
@@ -293,20 +478,11 @@ class CollaborativeFilteringRecommender:
             # User-based: compute similarity between users
             n_users = len(self.user_ids)
             
-            # Sample users if dataset is too large
-            if max_entities and n_users > max_entities:
-                print(f"  Dataset has {n_users:,} users. Sampling {max_entities:,} users for similarity computation...")
-                np.random.seed(42)
-                sampled_indices = np.random.choice(n_users, size=max_entities, replace=False)
-                sampled_indices = np.sort(sampled_indices)  # Keep sorted for consistency
-                sampled_user_ids = self.user_ids[sampled_indices]
-                sampled_matrix = self.user_item_matrix_sparse[sampled_indices, :]
-                print(f"  Computing similarities for {max_entities:,} sampled users...")
-            else:
-                sampled_indices = np.arange(n_users)
-                sampled_user_ids = self.user_ids
-                sampled_matrix = self.user_item_matrix_sparse
-                print(f"  Computing similarities for {n_users:,} users...")
+            # Process all users (no sampling)
+            sampled_indices = np.arange(n_users)
+            sampled_user_ids = self.user_ids
+            sampled_matrix = self.user_item_matrix_sparse
+            print(f"  Computing similarities for {n_users:,} users...")
             
             # Initialize sparse similarity storage (dictionary of dictionaries)
             similarity_dict = {}
@@ -316,6 +492,20 @@ class CollaborativeFilteringRecommender:
             n_sampled = len(sampled_user_ids)
             total_batches = (n_sampled + batch_size - 1) // batch_size
             
+            # Pre-compute user means if mean-centering is enabled
+            if use_mean_centering:
+                print("  Pre-computing user means for mean-centering...")
+                # Compute means directly from sparse matrix (much faster than converting to dense)
+                user_means = np.zeros(n_sampled)
+                for i in range(n_sampled):
+                    user_row = sampled_matrix[i, :]
+                    if user_row.nnz > 0:  # If user has ratings
+                        user_means[i] = user_row.data.mean()
+                print("  Mean-centering enabled (slower but more accurate)")
+            else:
+                user_means = None
+                print("  Mean-centering disabled (faster computation)")
+            
             for batch_idx in range(total_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min((batch_idx + 1) * batch_size, n_sampled)
@@ -323,9 +513,29 @@ class CollaborativeFilteringRecommender:
                 batch_global_indices = sampled_indices[start_idx:end_idx]
                 batch_users = sampled_user_ids[start_idx:end_idx]
                 
-                # Compute similarity for this batch against sampled users only
-                batch_matrix = sampled_matrix[batch_local_indices, :]
-                batch_similarity = cosine_similarity(batch_matrix, sampled_matrix)
+                # Extract batch users (convert to dense only for this batch)
+                batch_matrix = sampled_matrix[batch_local_indices, :].toarray()
+                
+                # Mean-center batch if enabled
+                if use_mean_centering and user_means is not None:
+                    for i, local_idx in enumerate(batch_local_indices):
+                        rated_mask = batch_matrix[i, :] > 0
+                        if rated_mask.sum() > 0:
+                            batch_matrix[i, rated_mask] -= user_means[local_idx]
+                
+                # For comparison matrix, use sparse when possible
+                if use_mean_centering and user_means is not None:
+                    # Need to mean-center the full comparison matrix
+                    comparison_matrix = sampled_matrix.toarray()
+                    for i in range(len(comparison_matrix)):
+                        rated_mask = comparison_matrix[i, :] > 0
+                        if rated_mask.sum() > 0:
+                            comparison_matrix[i, rated_mask] -= user_means[i]
+                    # Compute similarity on mean-centered matrices
+                    batch_similarity = cosine_similarity(batch_matrix, comparison_matrix)
+                else:
+                    # Use sparse matrix directly (much faster - no mean-centering)
+                    batch_similarity = cosine_similarity(batch_matrix, sampled_matrix)
                 
                 # For each user in batch, keep only top-k similarities
                 for i, user_id in enumerate(batch_users):
@@ -339,11 +549,11 @@ class CollaborativeFilteringRecommender:
                     # Map back to global user IDs
                     top_k_global_indices = sampled_indices[top_k_local_indices]
                     
-                    # Store only non-zero similarities
+                    # Store only similarities above threshold
                     similarity_dict[user_id] = {
                         self.user_ids[global_idx]: float(sim) 
                         for global_idx, sim in zip(top_k_global_indices, top_k_similarities) 
-                        if sim > 0
+                        if sim >= self.similarity_threshold
                     }
                 
                 if (batch_idx + 1) % 10 == 0 or batch_idx == total_batches - 1:
@@ -364,20 +574,11 @@ class CollaborativeFilteringRecommender:
             
             n_movies = len(self.movie_ids)
             
-            # Sample movies if dataset is too large
-            if max_entities and n_movies > max_entities:
-                print(f"  Dataset has {n_movies:,} movies. Sampling {max_entities:,} movies for similarity computation...")
-                np.random.seed(42)
-                sampled_indices = np.random.choice(n_movies, size=max_entities, replace=False)
-                sampled_indices = np.sort(sampled_indices)  # Keep sorted for consistency
-                sampled_movie_ids = self.movie_ids[sampled_indices]
-                sampled_matrix = item_user_matrix_sparse[sampled_indices, :]
-                print(f"  Computing similarities for {max_entities:,} sampled movies...")
-            else:
-                sampled_indices = np.arange(n_movies)
-                sampled_movie_ids = self.movie_ids
-                sampled_matrix = item_user_matrix_sparse
-                print(f"  Computing similarities for {n_movies:,} movies...")
+            # Process all movies (no sampling)
+            sampled_indices = np.arange(n_movies)
+            sampled_movie_ids = self.movie_ids
+            sampled_matrix = item_user_matrix_sparse
+            print(f"  Computing similarities for {n_movies:,} movies...")
             
             # Initialize sparse similarity storage
             similarity_dict = {}
@@ -387,6 +588,20 @@ class CollaborativeFilteringRecommender:
             n_sampled = len(sampled_movie_ids)
             total_batches = (n_sampled + batch_size - 1) // batch_size
             
+            # Pre-compute movie means if mean-centering is enabled
+            if use_mean_centering:
+                print("  Pre-computing movie means for mean-centering...")
+                # Compute means directly from sparse matrix (much faster than converting to dense)
+                movie_means = np.zeros(n_sampled)
+                for i in range(n_sampled):
+                    movie_row = sampled_matrix[i, :]
+                    if movie_row.nnz > 0:  # If movie has ratings
+                        movie_means[i] = movie_row.data.mean()
+                print("  Mean-centering enabled (slower but more accurate)")
+            else:
+                movie_means = None
+                print("  Mean-centering disabled (faster computation)")
+            
             for batch_idx in range(total_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min((batch_idx + 1) * batch_size, n_sampled)
@@ -394,9 +609,29 @@ class CollaborativeFilteringRecommender:
                 batch_global_indices = sampled_indices[start_idx:end_idx]
                 batch_movies = sampled_movie_ids[start_idx:end_idx]
                 
-                # Compute similarity for this batch against sampled movies only
-                batch_matrix = sampled_matrix[batch_local_indices, :]
-                batch_similarity = cosine_similarity(batch_matrix, sampled_matrix)
+                # Extract batch movies (convert to dense only for this batch)
+                batch_matrix = sampled_matrix[batch_local_indices, :].toarray()
+                
+                # Mean-center batch if enabled
+                if use_mean_centering and movie_means is not None:
+                    for i, local_idx in enumerate(batch_local_indices):
+                        rated_mask = batch_matrix[i, :] > 0
+                        if rated_mask.sum() > 0:
+                            batch_matrix[i, rated_mask] -= movie_means[local_idx]
+                
+                # For comparison matrix, use sparse when possible
+                if use_mean_centering and movie_means is not None:
+                    # Need to mean-center the full comparison matrix
+                    comparison_matrix = sampled_matrix.toarray()
+                    for i in range(len(comparison_matrix)):
+                        rated_mask = comparison_matrix[i, :] > 0
+                        if rated_mask.sum() > 0:
+                            comparison_matrix[i, rated_mask] -= movie_means[i]
+                    # Compute similarity on mean-centered matrices
+                    batch_similarity = cosine_similarity(batch_matrix, comparison_matrix)
+                else:
+                    # Use sparse matrix directly (much faster - no mean-centering)
+                    batch_similarity = cosine_similarity(batch_matrix, sampled_matrix)
                 
                 # For each movie in batch, keep only top-k similarities
                 for i, movie_id in enumerate(batch_movies):
@@ -410,11 +645,11 @@ class CollaborativeFilteringRecommender:
                     # Map back to global movie IDs
                     top_k_global_indices = sampled_indices[top_k_local_indices]
                     
-                    # Store only non-zero similarities
+                    # Store only similarities above threshold
                     similarity_dict[movie_id] = {
                         self.movie_ids[global_idx]: float(sim) 
                         for global_idx, sim in zip(top_k_global_indices, top_k_similarities) 
-                        if sim > 0
+                        if sim >= self.similarity_threshold
                     }
                 
                 if (batch_idx + 1) % 10 == 0 or batch_idx == total_batches - 1:
@@ -443,7 +678,7 @@ class CollaborativeFilteringRecommender:
         ratings_series = pd.Series(ratings_vector, index=self.movie_ids)
         return ratings_series[ratings_series > 0]  # Return only rated movies
     
-    def predict_rating_user_based(self, user_id: int, movie_id: int, k: int = 50) -> float:
+    def predict_rating_user_based(self, user_id: int, movie_id: int, k: int = 10) -> float:
         """
         Predict rating for a user-movie pair using user-based CF.
         
@@ -476,8 +711,15 @@ class CollaborativeFilteringRecommender:
         # we compute similarity on-the-fly
         if self.similarity_matrix_type == 'dict' and user_id not in self.similarity_matrix:
             # Compute similarity for this user on-the-fly against sampled users
-            user_vector = self._get_user_ratings_vector(user_id).reshape(1, -1)
-            user_vector_sparse = csr_matrix(user_vector)
+            user_vector = self._get_user_ratings_vector(user_id).copy()
+            
+            # Mean-center user vector
+            rated_mask = user_vector > 0
+            if rated_mask.sum() > 0:
+                user_vector_mean = user_vector[rated_mask].mean()
+                user_vector[rated_mask] -= user_vector_mean
+            
+            user_vector = user_vector.reshape(1, -1)
             
             # Get all users in similarity matrix (sampled users)
             sampled_user_ids = list(self.similarity_matrix.keys())
@@ -485,8 +727,17 @@ class CollaborativeFilteringRecommender:
             if len(sampled_indices) == 0:
                 return user_mean  # No similar users found
             
-            sampled_matrix = self.user_item_matrix_sparse[sampled_indices, :]
-            similarities = cosine_similarity(user_vector_sparse, sampled_matrix).flatten()
+            sampled_matrix = self.user_item_matrix_sparse[sampled_indices, :].toarray()
+            
+            # Mean-center sampled users
+            for i in range(len(sampled_matrix)):
+                sampled_ratings = sampled_matrix[i, :]
+                sampled_rated_mask = sampled_ratings > 0
+                if sampled_rated_mask.sum() > 0:
+                    sampled_user_mean = sampled_ratings[sampled_rated_mask].mean()
+                    sampled_matrix[i, sampled_rated_mask] -= sampled_user_mean
+            
+            similarities = cosine_similarity(user_vector, sampled_matrix).flatten()
             
             # Get top-k
             top_k_local_indices = np.argsort(similarities)[::-1][:k]
@@ -495,13 +746,13 @@ class CollaborativeFilteringRecommender:
             
             # Create temporary similarity dict for this user
             user_similarities_dict = {
-                uid: float(sim) for uid, sim in zip(top_k_user_ids, top_k_similarities) if sim > 0
+                uid: float(sim) for uid, sim in zip(top_k_user_ids, top_k_similarities) if sim >= self.similarity_threshold
             }
         else:
             user_similarities = self._get_similarities(user_id).sort_values(ascending=False)
             user_similarities = user_similarities[user_similarities.index != user_id]  # Exclude self
             top_k_users = user_similarities.head(k)
-            user_similarities_dict = {uid: sim for uid, sim in top_k_users.items() if sim > 0}
+            user_similarities_dict = {uid: sim for uid, sim in top_k_users.items() if sim >= self.similarity_threshold}
         
         # Calculate weighted average using similarities
         top_k_users = user_similarities_dict
@@ -511,7 +762,7 @@ class CollaborativeFilteringRecommender:
         denominator = 0
         
         for similar_user_id, similarity in top_k_users.items():
-            if similarity <= 0:
+            if similarity < self.similarity_threshold:
                 continue
                 
             similar_user_rating = self._get_user_rating(similar_user_id, movie_id)
@@ -532,7 +783,7 @@ class CollaborativeFilteringRecommender:
         
         return predicted_rating
     
-    def predict_rating_item_based(self, user_id: int, movie_id: int, k: int = 50) -> float:
+    def predict_rating_item_based(self, user_id: int, movie_id: int, k: int = 10) -> float:
         """
         Predict rating for a user-movie pair using item-based CF.
         
@@ -574,7 +825,15 @@ class CollaborativeFilteringRecommender:
                 return 0.0
             
             movie_idx = self.movie_to_idx[movie_id]
-            movie_vector = self.user_item_matrix_sparse[:, movie_idx].T  # Transpose to row vector
+            movie_vector = self.user_item_matrix_sparse[:, movie_idx].toarray().flatten()
+            
+            # Mean-center movie vector
+            rated_mask = movie_vector > 0
+            if rated_mask.sum() > 0:
+                movie_vector_mean = movie_vector[rated_mask].mean()
+                movie_vector[rated_mask] -= movie_vector_mean
+            
+            movie_vector = movie_vector.reshape(1, -1)
             
             # Get all movies in similarity matrix (sampled movies)
             sampled_movie_ids = list(self.similarity_matrix.keys())
@@ -582,7 +841,16 @@ class CollaborativeFilteringRecommender:
             if len(sampled_indices) == 0:
                 return user_rated_movie_ratings.mean() if len(user_rated_movie_ratings) > 0 else 0.0
             
-            sampled_matrix = self.user_item_matrix_sparse[:, sampled_indices].T
+            sampled_matrix = self.user_item_matrix_sparse[:, sampled_indices].toarray().T
+            
+            # Mean-center sampled movies
+            for i in range(len(sampled_matrix)):
+                sampled_ratings = sampled_matrix[i, :]
+                sampled_rated_mask = sampled_ratings > 0
+                if sampled_rated_mask.sum() > 0:
+                    sampled_movie_mean = sampled_ratings[sampled_rated_mask].mean()
+                    sampled_matrix[i, sampled_rated_mask] -= sampled_movie_mean
+            
             similarities = cosine_similarity(movie_vector, sampled_matrix).flatten()
             
             # Get top-k
@@ -592,7 +860,7 @@ class CollaborativeFilteringRecommender:
             
             # Create temporary similarity dict for this movie
             movie_similarities_dict = {
-                mid: float(sim) for mid, sim in zip(top_k_movie_ids, top_k_similarities) if sim > 0
+                mid: float(sim) for mid, sim in zip(top_k_movie_ids, top_k_similarities) if sim >= self.similarity_threshold
             }
         else:
             if self.similarity_matrix_type == 'dict':
@@ -604,7 +872,7 @@ class CollaborativeFilteringRecommender:
             
             movie_similarities = self._get_similarities(movie_id).sort_values(ascending=False)
             movie_similarities = movie_similarities[movie_similarities.index != movie_id]  # Exclude self
-            movie_similarities_dict = {mid: sim for mid, sim in movie_similarities.head(k).items() if sim > 0}
+            movie_similarities_dict = {mid: sim for mid, sim in movie_similarities.head(k).items() if sim >= self.similarity_threshold}
         
         # Only consider movies the user has rated
         rated_movie_similarities = {
@@ -619,7 +887,7 @@ class CollaborativeFilteringRecommender:
         denominator = 0
         
         for similar_movie_id, similarity in top_k_movies.items():
-            if similarity <= 0:
+            if similarity < self.similarity_threshold:
                 continue
             
             # Find the rating for this movie
@@ -639,7 +907,7 @@ class CollaborativeFilteringRecommender:
         
         return predicted_rating
     
-    def recommend_movies(self, user_id: int, n_recommendations: int = 10, k: int = 50) -> List[Tuple[int, str, float]]:
+    def recommend_movies(self, user_id: int, n_recommendations: int = 10, k: int = 10) -> List[Tuple[int, str, float]]:
         """
         Generate movie recommendations for a user.
         
@@ -664,18 +932,28 @@ class CollaborativeFilteringRecommender:
         user_ratings = self.get_user_ratings(user_id)
         rated_movie_ids = set(user_ratings.index)
         
-        # Get all movie IDs
-        all_movie_ids = set(self.movie_ids)
+        # Get candidate movies (popular/well-rated movies that user hasn't rated)
+        # This is much more efficient than predicting for all 20k+ movies
+        candidate_movies = self.get_popular_movies(n=500)  # Get top 500 popular movies
+        candidate_movie_ids = {movie_id for movie_id, _, _ in candidate_movies}
         
-        # Movies to predict (not yet rated)
-        unrated_movies = all_movie_ids - rated_movie_ids
+        # Filter to only unrated movies
+        unrated_candidates = candidate_movie_ids - rated_movie_ids
         
-        print(f"Predicting ratings for {len(unrated_movies):,} unrated movies...")
+        if len(unrated_candidates) == 0:
+            # Fallback: use all unrated movies if no popular candidates
+            all_movie_ids = set(self.movie_ids)
+            unrated_candidates = all_movie_ids - rated_movie_ids
+            unrated_candidates = list(unrated_candidates)[:1000]  # Limit to 1000
+        else:
+            unrated_candidates = list(unrated_candidates)
         
-        # Predict ratings for unrated movies
+        print(f"Evaluating {len(unrated_candidates):,} movies you haven't rated yet...")
+        
+        # Predict ratings for candidate movies
         predictions = []
         
-        for movie_id in list(unrated_movies)[:1000]:  # Limit to 1000 for efficiency
+        for movie_id in unrated_candidates:
             if self.method == 'user':
                 pred_rating = self.predict_rating_user_based(user_id, movie_id, k)
             else:
@@ -725,7 +1003,7 @@ class CollaborativeFilteringRecommender:
         user_similarities = self._get_similarities(user_id).sort_values(ascending=False)
         user_similarities = user_similarities[user_similarities.index != user_id]
         
-        return [(uid, float(sim)) for uid, sim in user_similarities.head(n).items() if sim > 0]
+        return [(uid, float(sim)) for uid, sim in user_similarities.head(n).items() if sim >= self.similarity_threshold]
     
     def get_similar_movies(self, movie_id: int, n: int = 10) -> List[Tuple[int, str, float]]:
         """
@@ -754,7 +1032,7 @@ class CollaborativeFilteringRecommender:
         
         similar_movies = []
         for similar_movie_id, similarity in movie_similarities.head(n).items():
-            if similarity > 0:
+            if similarity >= self.similarity_threshold:
                 movie_info = self.movies_df[self.movies_df['movieId'] == similar_movie_id]
                 if len(movie_info) > 0:
                     title = movie_info.iloc[0]['title']
@@ -800,14 +1078,48 @@ class CollaborativeFilteringRecommender:
         self.user_ids = np.append(self.user_ids, new_user_id)
         self.user_to_idx[new_user_id] = len(self.user_ids) - 1
         
-        # Recompute similarity if needed (for user-based CF)
-        # Note: For large datasets, recomputing full similarity is expensive
-        # This is a simplified version - in production, you'd want to incrementally update
+        # For user-based CF, compute similarities only for the new user (not all users)
+        # This is much faster than recomputing the entire similarity matrix
         if self.method == 'user':
-            # For now, we'll need to recompute (this is expensive for large datasets)
-            # In a production system, you'd want incremental updates
-            print("Warning: Recomputing similarity matrix for new user (this may take time)...")
-            self.compute_similarity(use_cache=False)
+            if self.similarity_matrix is None:
+                # If no similarity matrix exists, we need to compute it
+                print("Computing similarity matrix (first time)...")
+                self.compute_similarity(use_cache=False)
+            else:
+                # Just compute similarities for the new user against existing users
+                print("Computing similarities for new user (fast incremental update)...")
+                new_user_idx = self.user_to_idx[new_user_id]
+                new_user_vector = self.user_item_matrix_sparse[new_user_idx, :].toarray().flatten()
+                
+                # Get all existing users (excluding the new one)
+                existing_user_indices = np.arange(len(self.user_ids) - 1)
+                existing_user_matrix = self.user_item_matrix_sparse[existing_user_indices, :]
+                
+                # Compute similarity for new user against all existing users
+                new_user_vector_2d = new_user_vector.reshape(1, -1)
+                similarities = cosine_similarity(new_user_vector_2d, existing_user_matrix).flatten()
+                
+                # Get top-k similar users
+                top_k_indices = np.argsort(similarities)[::-1][:10]  # top 10
+                top_k_similarities = similarities[top_k_indices]
+                top_k_user_ids = self.user_ids[existing_user_indices[top_k_indices]]
+                
+                # Add new user's similarities to the similarity matrix
+                if self.similarity_matrix_type == 'dict':
+                    # Store only similarities above threshold
+                    self.similarity_matrix[new_user_id] = {
+                        uid: float(sim) for uid, sim in zip(top_k_user_ids, top_k_similarities)
+                        if sim >= self.similarity_threshold
+                    }
+                    print(f"✓ Added new user {new_user_id} with {len(self.similarity_matrix[new_user_id])} similar users")
+                else:
+                    # If using DataFrame, convert to dict format
+                    self.similarity_matrix = {}
+                    self.similarity_matrix_type = 'dict'
+                    self.similarity_matrix[new_user_id] = {
+                        uid: float(sim) for uid, sim in zip(top_k_user_ids, top_k_similarities)
+                        if sim >= self.similarity_threshold
+                    }
         
         return new_user_id
     
@@ -939,6 +1251,9 @@ class CollaborativeFilteringRecommender:
         # Filter movie_stats to only include genre movies
         movie_stats = movie_stats[movie_stats['movieId'].isin(genre_movies)]
         
+        # Remove duplicates (in case a movie appears multiple times)
+        movie_stats = movie_stats.drop_duplicates(subset=['movieId'])
+        
         # Sort by average rating and number of ratings
         movie_stats = movie_stats.sort_values(
             ['avg_rating', 'num_ratings'],
@@ -996,7 +1311,7 @@ class CollaborativeFilteringRecommender:
         
         return results
     
-    def evaluate_rating_prediction(self, test_ratings: pd.DataFrame, k: int = 50, 
+    def evaluate_rating_prediction(self, test_ratings: pd.DataFrame, k: int = 10, 
                                    max_samples: int = 10000) -> Dict[str, float]:
         """
         Evaluate rating prediction accuracy using RMSE and MAE.
@@ -1065,7 +1380,7 @@ class CollaborativeFilteringRecommender:
             'n_samples': len(predictions)
         }
     
-    def evaluate_ranking(self, test_ratings: pd.DataFrame, k: int = 50, 
+    def evaluate_ranking(self, test_ratings: pd.DataFrame, k: int = 10, 
                         top_k: int = 10, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
         """
         Evaluate ranking quality using Precision@K, Recall@K, F1@K, and NDCG@K.
@@ -1197,7 +1512,7 @@ class CollaborativeFilteringRecommender:
         
         return dcg / idcg if idcg > 0 else 0.0
     
-    def calculate_coverage(self, n_recommendations: int = 10, k: int = 50, 
+    def calculate_coverage(self, n_recommendations: int = 10, k: int = 10, 
                           sample_users: int = 100) -> Dict[str, float]:
         """
         Calculate recommendation coverage (fraction of movies that can be recommended).
@@ -1271,7 +1586,7 @@ class CollaborativeFilteringRecommender:
             for i, movie_id1 in enumerate(movie_ids):
                 for movie_id2 in movie_ids[i+1:]:
                     sim = self._get_similarity(movie_id1, movie_id2)
-                    if sim > 0:
+                    if sim >= self.similarity_threshold:
                         similarities.append(sim)
             
             if len(similarities) > 0:
@@ -1309,7 +1624,7 @@ class CollaborativeFilteringRecommender:
         
         return train_ratings, test_ratings
     
-    def evaluate_model(self, test_ratings: pd.DataFrame, k: int = 50, 
+    def evaluate_model(self, test_ratings: pd.DataFrame, k: int = 10, 
                       top_k: int = 10, threshold: float = 4.0,
                       max_samples: int = 10000, max_users: int = 100) -> Dict[str, float]:
         """
@@ -1489,6 +1804,16 @@ def interactive_new_user_mode(recommender):
             movies_to_rate = [(m[0], m[1], m[2], '') for m in recommender.get_popular_movies(n=30)]
             print(f"\nHere are some popular movies. Please rate at least {min_ratings} of them:")
         
+        # Deduplicate movies by movie_id (in case of duplicates)
+        seen_movie_ids = set()
+        deduplicated_movies = []
+        for movie_data in movies_to_rate:
+            movie_id = movie_data[0]
+            if movie_id not in seen_movie_ids:
+                seen_movie_ids.add(movie_id)
+                deduplicated_movies.append(movie_data)
+        movies_to_rate = deduplicated_movies
+        
         print(f"(You've already rated {len(user_ratings)} movies. Need at least {min_ratings} total.)\n")
         
         for i, movie_data in enumerate(movies_to_rate, 1):
@@ -1568,7 +1893,7 @@ def interactive_new_user_mode(recommender):
     print("-" * 60)
     
     # Get recommendations
-    recommendations = recommender.recommend_movies(new_user_id, n_recommendations=15, k=50)
+    recommendations = recommender.recommend_movies(new_user_id, n_recommendations=15, k=10)
     
     if not recommendations:
         print("Sorry, we couldn't generate recommendations. Try rating more diverse movies.")
@@ -1614,14 +1939,8 @@ def main(user_id: int = 1, method: str = None):
             method=cf_method
         )
         
-        # Load data
-        recommender.load_data()
-        
-        # Create user-item matrix
-        recommender.create_user_item_matrix()
-        
-        # Compute similarity
-        recommender.compute_similarity()
+        # Load model (uses cache if available to skip retraining)
+        recommender.load_model(use_cache=True)
         
         # Check if user exists
         if user_id not in recommender.user_ids:
@@ -1736,7 +2055,7 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
     # Evaluate on test set
     print("\n" + "=" * 60)
     print(f"Using relevance threshold: rating >= {threshold}")
-    metrics = recommender.evaluate_model(test_ratings, k=50, top_k=10, threshold=threshold)
+    metrics = recommender.evaluate_model(test_ratings, k=10, top_k=10, threshold=threshold)
     
     # Display results
     print("\n" + "=" * 60)
@@ -1778,18 +2097,69 @@ def main_interactive(method: str = 'user'):
         method=method
     )
     
-    # Load data
-    print("\nLoading data...")
-    recommender.load_data()
-    
-    # Create user-item matrix
-    recommender.create_user_item_matrix()
-    
-    # Compute similarity
-    recommender.compute_similarity()
+    # Load model (uses cache if available to skip retraining)
+    print("\nLoading model...")
+    recommender.load_model(use_cache=True)
     
     # Run interactive mode
     interactive_new_user_mode(recommender)
+
+
+def clear_cache(ratings_file: str = 'ratings_full.csv', movies_file: str = 'movies_clean.csv', 
+                method: str = None):
+    """
+    Clear all cache files for the recommender system.
+    
+    Parameters:
+    -----------
+    ratings_file : str
+        Ratings file name (default: 'ratings_full.csv')
+    movies_file : str
+        Movies file name (default: 'movies_clean.csv')
+    method : str, optional
+        'user' or 'item' to clear cache for specific method, or None to clear all
+    """
+    import shutil
+    from pathlib import Path
+    
+    cache_dir = Path('.cache')
+    
+    if not cache_dir.exists():
+        print("No cache directory found. Nothing to clear.")
+        return
+    
+    if method:
+        # Clear cache for specific method
+        ratings_basename = Path(ratings_file).stem
+        movies_basename = Path(movies_file).stem
+        patterns = [
+            f"model_{ratings_basename}_{movies_basename}_{method}.pkl",
+            f"similarity_{ratings_basename}_{movies_basename}_{method}.pkl"
+        ]
+        deleted = 0
+        for pattern in patterns:
+            cache_file = cache_dir / pattern
+            if cache_file.exists():
+                cache_file.unlink()
+                deleted += 1
+                print(f"Deleted: {cache_file.name}")
+        
+        if deleted == 0:
+            print(f"No cache files found for {method}-based method.")
+        else:
+            print(f"Cleared {deleted} cache file(s) for {method}-based method.")
+    else:
+        # Clear all cache files
+        cache_files = list(cache_dir.glob('*.pkl'))
+        if not cache_files:
+            print("No cache files found. Nothing to clear.")
+            return
+        
+        for cache_file in cache_files:
+            cache_file.unlink()
+            print(f"Deleted: {cache_file.name}")
+        
+        print(f"Cleared {len(cache_files)} cache file(s).")
 
 
 if __name__ == "__main__":
@@ -1818,6 +2188,12 @@ Examples:
   
   # Run interactive mode with item-based CF
   python movie_recommender.py --interactive --method item
+  
+  # Clear all cache files
+  python movie_recommender.py --clear-cache
+  
+  # Clear cache for specific method
+  python movie_recommender.py --clear-cache --method user
         """
     )
     
@@ -1865,7 +2241,22 @@ Examples:
         help='Rating threshold to consider a movie as "relevant" in evaluation (default: 4.0)'
     )
     
+    parser.add_argument(
+        '--clear-cache',
+        action='store_true',
+        help='Clear all cached model files and exit'
+    )
+    
     args = parser.parse_args()
+    
+    # Handle cache clearing
+    if args.clear_cache:
+        print("=" * 60)
+        print("Clearing Cache")
+        print("=" * 60)
+        clear_cache(method=args.method)
+        print("=" * 60)
+        sys.exit(0)
     
     # Check which mode to run
     if args.evaluate:
