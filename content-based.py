@@ -13,6 +13,11 @@ df2 = pd.read_csv("/kaggle/input/modelingdataset/movies_full.csv")
 print("Shape:", df2.shape)
 df2.head()
 
+#把genre和tags单独列出来
+genre_cols = df2.columns[5:30]
+tag_cols   = df2.columns[30:1158]
+id_cols = ["movieId", "clean_title"]
+
 # 弄成一个vector，把数值小于0.2的降为0
 G = df2[genre_cols].astype(float).values
 T = df2[tag_cols].astype(float).values
