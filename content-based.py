@@ -9,7 +9,7 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 2000)
 
 # Read movies_full.csv
-df2 = pd.read_csv("/kaggle/input/modelingdataset/movies_full.csv")
+df2 = pd.read_csv("movies_full.csv")
 print("Shape:", df2.shape)
 df2.head()
 
@@ -77,7 +77,7 @@ def get_movie_ids_from_titles(df, titles):
 
 # 推荐结果
 X_emb = np.load("movie_embeddings.npy")
-recs = user_recommendation(df, X_emb, liked_movie_ids=[1, 296, 318], k=10)
+recs = user_recommendation_ann(df2, X_emb, liked_movie_ids=[1, 296, 318], k=10)
 
 for mid, title, sim in recs:
     print(f"{title:40s} (id={mid})  sim={sim:.3f}")
