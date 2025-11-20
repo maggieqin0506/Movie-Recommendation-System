@@ -14,6 +14,18 @@ import re
 import pickle
 import os
 from pathlib import Path
+# Import content-based recommendation functions
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("content_based", "content-based.py")
+    content_based_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(content_based_module)
+    user_recommendation_ann = content_based_module.user_recommendation_ann
+    load_content_based_system = content_based_module.load_content_based_system
+except Exception as e:
+    # Fallback if import fails
+    user_recommendation_ann = None
+    load_content_based_system = None
 warnings.filterwarnings('ignore')
 
 
@@ -52,6 +64,12 @@ class CollaborativeFilteringRecommender:
         self.user_to_idx = None
         self.movie_to_idx = None
         self.similarity_matrix_type = None  # 'dict' or 'dataframe'
+        
+        # Content-based filtering components
+        self.movies_full_df = None  # Full movies dataframe with genres and tags
+        self.movie_embeddings = None  # Movie embeddings from content-based system
+        self.content_nn = None  # NearestNeighbors model for content-based recommendations
+        self.content_id_to_idx = None  # Mapping from movieId to embedding index
         
     def _get_cache_path(self, cache_type: str = 'similarity') -> str:
         """
@@ -253,6 +271,11 @@ class CollaborativeFilteringRecommender:
                             self.ratings_df = self.ratings_df[self.ratings_df['movieId'].isin(self.movie_ids)]
                         
                         print(f"Loaded full {self.method}-based model from cache (skipping retraining)")
+                        # Try to load content-based system (optional, won't fail if files don't exist)
+                        try:
+                            self._load_content_based_system()
+                        except Exception:
+                            pass  # Content-based is optional
                         return True
                     else:
                         print("Cached model is incomplete, rebuilding...")
@@ -262,6 +285,12 @@ class CollaborativeFilteringRecommender:
         self.load_data(min_year=min_year)
         self.create_user_item_matrix()
         self.compute_similarity()
+        
+        # Try to load content-based system (optional, won't fail if files don't exist)
+        try:
+            self._load_content_based_system()
+        except Exception:
+            pass  # Content-based is optional
         
         # Save full model to cache
         if use_cache:
@@ -1040,6 +1069,106 @@ class CollaborativeFilteringRecommender:
         
         return similar_movies
     
+    def _load_content_based_system(self, movies_full_file: str = 'movies_full.csv', 
+                                   embeddings_file: str = 'movie_embeddings.npy'):
+        """
+        Load content-based recommendation system components using content-based.py.
+        Automatically generates embeddings if they don't exist.
+        
+        Parameters:
+        -----------
+        movies_full_file : str
+            Path to movies_full.csv file with genres and tags
+        embeddings_file : str
+            Path to movie_embeddings.npy file
+        """
+        if self.movie_embeddings is not None and self.content_nn is not None:
+            return  # Already loaded
+        
+        if load_content_based_system is None:
+            raise ImportError("Could not import content-based module. Please ensure content-based.py exists.")
+        
+        print("Loading content-based system...")
+        # Use the function from content-based.py (auto-generates embeddings if needed)
+        self.movies_full_df, self.movie_embeddings, self.content_nn = load_content_based_system(
+            movies_full_file, embeddings_file, auto_generate=True
+        )
+        
+        # Create mapping from movieId to embedding index
+        self.content_id_to_idx = pd.Series(
+            self.movies_full_df.index.values, 
+            index=self.movies_full_df["movieId"]
+        ).to_dict()
+        
+        print("Content-based system ready.")
+    
+    def recommend_movies_content_based(self, user_id: int, n_recommendations: int = 10, 
+                                       candidates: int = 500) -> List[Tuple[int, str, float]]:
+        """
+        Generate content-based movie recommendations for a user.
+        
+        Parameters:
+        -----------
+        user_id : int
+            User ID
+        n_recommendations : int
+            Number of recommendations to return
+        candidates : int
+            Number of candidate movies to consider
+            
+        Returns:
+        --------
+        List[Tuple[int, str, float]]
+            List of (movie_id, title, similarity_score) tuples
+        """
+        if user_id not in self.user_ids:
+            raise ValueError(f"User {user_id} not found in the dataset")
+        
+        # Load content-based system if not already loaded
+        if self.movie_embeddings is None:
+            self._load_content_based_system()
+        
+        # Get user's ratings
+        user_ratings = self.get_user_ratings(user_id)
+        rated_movie_ids = set(user_ratings.index)
+        
+        # Use all rated movies (not just "liked" ones) to build user profile
+        # This way we use all the rating information, not just high ratings
+        all_rated_movie_ids = list(user_ratings.index)
+        
+        if len(all_rated_movie_ids) == 0:
+            return []
+        
+        # Create rating dictionary for weighted averaging
+        movie_ratings_dict = {mid: rating for mid, rating in user_ratings.items()}
+        
+        if user_recommendation_ann is None:
+            raise ImportError("Could not import user_recommendation_ann from content-based.py")
+        
+        # Use the function from content-based.py with all ratings and rating weights
+        content_recs = user_recommendation_ann(
+            self.movies_full_df,
+            self.movie_embeddings,
+            self.content_nn,
+            all_rated_movie_ids,
+            k=n_recommendations,
+            candidates=candidates,
+            movie_ratings=movie_ratings_dict  # Pass ratings for weighted average
+        )
+        
+        # Filter to only movies in current dataset (after year filtering) and get titles
+        recommendations = []
+        for movie_id, clean_title, sim_score in content_recs:
+            # Filter to only movies in current dataset
+            if movie_id in self.movie_ids:
+                # Get title from movies_df (current dataset)
+                movie_info = self.movies_df[self.movies_df['movieId'] == movie_id]
+                if len(movie_info) > 0:
+                    title = movie_info.iloc[0]['title']
+                    recommendations.append((movie_id, title, float(sim_score)))
+        
+        return recommendations
+    
     def add_new_user_ratings(self, user_ratings: Dict[int, float]) -> int:
         """
         Add a new user with their ratings to the system.
@@ -1670,14 +1799,16 @@ class CollaborativeFilteringRecommender:
         return all_metrics
 
 
-def interactive_new_user_mode(recommender):
+def interactive_new_user_mode(recommender, show_both_cf=True):
     """
     Interactive mode for new users to rate movies and get recommendations.
     
     Parameters:
     -----------
     recommender : CollaborativeFilteringRecommender
-        Initialized recommender object
+        Initialized recommender object (primary method)
+    show_both_cf : bool
+        If True, shows both user-based and item-based CF recommendations (default: True)
     """
     print("\n" + "=" * 60)
     print("Welcome! New User Movie Recommendation System")
@@ -1698,9 +1829,10 @@ def interactive_new_user_mode(recommender):
     
     # Step 1: Ask about genre preferences
     print("\n" + "=" * 60)
-    print("Step 1: Select Your Favorite Genres")
+    print("Step 1: Select Your Favorite Genres (Optional)")
     print("=" * 60)
-    print("\nThis helps us show you movies you're more likely to know and enjoy!")
+    print("\nThis will help us show you movies from your preferred genres in Step 3.")
+    print("If you skip this, we'll show you popular movies from all genres.")
     
     all_genres = recommender.get_all_genres()
     print(f"\nAvailable genres ({len(all_genres)} total):")
@@ -1794,15 +1926,17 @@ def interactive_new_user_mode(recommender):
     # Step 3: Show movies from selected genres (or popular movies)
     if len(user_ratings) < min_ratings:
         print("\n" + "=" * 60)
-        print("Step 3: Rate Movies from Your Preferred Genres")
+        print("Step 3: Rate Movies to Build Your Profile")
         print("=" * 60)
         
         if selected_genres:
             movies_to_rate = recommender.get_movies_by_genres(selected_genres, n=30)
             print(f"\nHere are popular movies from your selected genres ({', '.join(selected_genres)}):")
+            print("(Based on your genre preferences from Step 1)")
         else:
             movies_to_rate = [(m[0], m[1], m[2], '') for m in recommender.get_popular_movies(n=30)]
-            print(f"\nHere are some popular movies. Please rate at least {min_ratings} of them:")
+            print(f"\nHere are some popular movies from all genres:")
+            print("(You can skip movies you haven't seen)")
         
         # Deduplicate movies by movie_id (in case of duplicates)
         seen_movie_ids = set()
@@ -1892,18 +2026,67 @@ def interactive_new_user_mode(recommender):
     print("\nGenerating personalized recommendations...")
     print("-" * 60)
     
-    # Get recommendations
-    recommendations = recommender.recommend_movies(new_user_id, n_recommendations=15, k=10)
+    # Get collaborative filtering recommendations from primary recommender
+    cf_recommendations_primary = recommender.recommend_movies(new_user_id, n_recommendations=10, k=10)
     
-    if not recommendations:
-        print("Sorry, we couldn't generate recommendations. Try rating more diverse movies.")
-        return
+    # Get recommendations from the other CF method if show_both_cf is True
+    cf_recommendations_secondary = []
+    if show_both_cf:
+        other_method = 'item' if recommender.method == 'user' else 'user'
+        print(f"\nLoading {other_method}-based model for additional recommendations...")
+        try:
+            # Create the other recommender
+            other_recommender = CollaborativeFilteringRecommender(
+                ratings_file=recommender.ratings_file,
+                movies_file=recommender.movies_file,
+                method=other_method,
+                similarity_threshold=recommender.similarity_threshold
+            )
+            # Load model (should use cache)
+            other_recommender.load_model(use_cache=True)
+            # Add the new user to the other recommender as well
+            other_new_user_id = other_recommender.add_new_user_ratings(user_ratings)
+            # Get recommendations
+            cf_recommendations_secondary = other_recommender.recommend_movies(other_new_user_id, n_recommendations=10, k=10)
+        except Exception as e:
+            print(f"Note: Could not load {other_method}-based recommendations: {e}")
     
-    print(f"\n🎬 Your Personalized Movie Recommendations:")
-    print("=" * 60)
-    for i, (movie_id, title, pred_rating) in enumerate(recommendations, 1):
-        print(f"{i:2d}. {title}")
-        print(f"    Predicted Rating: {pred_rating:.2f}/5.0")
+    # Get content-based recommendations
+    try:
+        cb_recommendations = recommender.recommend_movies_content_based(new_user_id, n_recommendations=10)
+    except Exception as e:
+        print(f"Note: Content-based recommendations unavailable: {e}")
+        cb_recommendations = []
+    
+    # Display Collaborative Filtering recommendations (primary method)
+    if cf_recommendations_primary:
+        method_name = "User-Based" if recommender.method == 'user' else "Item-Based"
+        print(f"\n🎬 Collaborative Filtering Recommendations ({method_name}):")
+        print("=" * 60)
+        for i, (movie_id, title, pred_rating) in enumerate(cf_recommendations_primary, 1):
+            print(f"{i:2d}. {title}")
+            print(f"    Predicted Rating: {pred_rating:.2f}/5.0")
+    else:
+        print("\n⚠ No collaborative filtering recommendations available.")
+    
+    # Display Collaborative Filtering recommendations (secondary method)
+    if show_both_cf and cf_recommendations_secondary:
+        other_method_name = "Item-Based" if recommender.method == 'user' else "User-Based"
+        print(f"\n🎬 Collaborative Filtering Recommendations ({other_method_name}):")
+        print("=" * 60)
+        for i, (movie_id, title, pred_rating) in enumerate(cf_recommendations_secondary, 1):
+            print(f"{i:2d}. {title}")
+            print(f"    Predicted Rating: {pred_rating:.2f}/5.0")
+    
+    # Display Content-Based recommendations
+    if cb_recommendations:
+        print(f"\n🎬 Content-Based Recommendations:")
+        print("=" * 60)
+        for i, (movie_id, title, sim_score) in enumerate(cb_recommendations, 1):
+            print(f"{i:2d}. {title}")
+            print(f"    Similarity Score: {sim_score:.3f}")
+    else:
+        print("\n⚠ No content-based recommendations available.")
     
     print("\n" + "=" * 60)
     print("Thank you for using our recommendation system!")
@@ -1960,13 +2143,50 @@ def main(user_id: int = 1, method: str = None):
                 if len(movie_info) > 0:
                     print(f"  - {movie_info.iloc[0]['title']}: {rating:.1f}")
         
-        # Get recommendations
-        recommendations = recommender.recommend_movies(user_id, n_recommendations=10)
+        # Get collaborative filtering recommendations (primary method)
+        cf_recommendations = recommender.recommend_movies(user_id, n_recommendations=10)
         
-        print(f"\nTop 10 Recommendations for User {user_id} ({method_name}):")
+        print(f"\nTop 10 Collaborative Filtering Recommendations for User {user_id} ({method_name}):")
         print("-" * 60)
-        for i, (movie_id, title, pred_rating) in enumerate(recommendations, 1):
+        for i, (movie_id, title, pred_rating) in enumerate(cf_recommendations, 1):
             print(f"{i:2d}. {title} (Predicted Rating: {pred_rating:.2f})")
+        
+        # Get recommendations from the other CF method if showing both
+        if method is None or len(methods_to_run) > 1:
+            # Already showing both, skip
+            pass
+        else:
+            # Show the other method as well
+            other_method = 'item' if cf_method == 'user' else 'user'
+            other_method_name = "Item-Based" if other_method == 'item' else "User-Based"
+            try:
+                other_recommender = CollaborativeFilteringRecommender(
+                    ratings_file='ratings_full.csv',
+                    movies_file='movies_clean.csv',
+                    method=other_method
+                )
+                other_recommender.load_model(use_cache=True)
+                other_cf_recommendations = other_recommender.recommend_movies(user_id, n_recommendations=10)
+                
+                if other_cf_recommendations:
+                    print(f"\nTop 10 Collaborative Filtering Recommendations for User {user_id} ({other_method_name}):")
+                    print("-" * 60)
+                    for i, (movie_id, title, pred_rating) in enumerate(other_cf_recommendations, 1):
+                        print(f"{i:2d}. {title} (Predicted Rating: {pred_rating:.2f})")
+            except Exception as e:
+                print(f"\nNote: {other_method_name} recommendations unavailable: {e}")
+        
+        # Get content-based recommendations (only show once, not per method)
+        if cf_method == methods_to_run[0]:  # Only show content-based once
+            try:
+                cb_recommendations = recommender.recommend_movies_content_based(user_id, n_recommendations=10)
+                if cb_recommendations:
+                    print(f"\nTop 10 Content-Based Recommendations for User {user_id}:")
+                    print("-" * 60)
+                    for i, (movie_id, title, sim_score) in enumerate(cb_recommendations, 1):
+                        print(f"{i:2d}. {title} (Similarity: {sim_score:.3f})")
+            except Exception as e:
+                print(f"\nNote: Content-based recommendations unavailable: {e}")
         
         # Show similar movies (only for item-based CF)
         if cf_method == 'item':
@@ -1978,8 +2198,8 @@ def main(user_id: int = 1, method: str = None):
             sample_movie_id = None
             
             # First, try to use the top recommendation
-            if recommendations and len(recommendations) > 0:
-                sample_movie_id = recommendations[0][0]  # Use top recommended movie
+            if cf_recommendations and len(cf_recommendations) > 0:
+                sample_movie_id = cf_recommendations[0][0]  # Use top recommended movie
             else:
                 # Fall back to a movie the user has rated highly
                 user_rated = recommender.get_user_ratings(user_id)
@@ -2076,18 +2296,24 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
     print("=" * 60)
 
 
-def main_interactive(method: str = 'user'):
+def main_interactive(method: str = 'user', show_both_cf: bool = True):
     """
     Interactive mode for new users.
     
     Parameters:
     -----------
     method : str
-        'user' for user-based CF or 'item' for item-based CF
+        'user' for user-based CF or 'item' for item-based CF (primary method)
+    show_both_cf : bool
+        If True, shows both user-based and item-based CF recommendations (default: True)
     """
     method_name = "User-Based" if method == 'user' else "Item-Based"
     print("=" * 60)
-    print(f"Movie Recommendation System - Interactive Mode ({method_name})")
+    print(f"Movie Recommendation System - Interactive Mode")
+    if show_both_cf:
+        print("(Showing both User-Based and Item-Based CF recommendations)")
+    else:
+        print(f"({method_name} only)")
     print("=" * 60)
     
     # Initialize recommender
@@ -2102,7 +2328,7 @@ def main_interactive(method: str = 'user'):
     recommender.load_model(use_cache=True)
     
     # Run interactive mode
-    interactive_new_user_mode(recommender)
+    interactive_new_user_mode(recommender, show_both_cf=show_both_cf)
 
 
 def clear_cache(ratings_file: str = 'ratings_full.csv', movies_file: str = 'movies_clean.csv', 
