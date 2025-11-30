@@ -271,11 +271,8 @@ class CollaborativeFilteringRecommender:
                             self.ratings_df = self.ratings_df[self.ratings_df['movieId'].isin(self.movie_ids)]
                         
                         print(f"Loaded full {self.method}-based model from cache (skipping retraining)")
-                        # Try to load content-based system (optional, won't fail if files don't exist)
-                        try:
-                            self._load_content_based_system()
-                        except Exception:
-                            pass  # Content-based is optional
+                        # Content-based system will be loaded lazily when needed
+                        # (not loaded here to avoid blocking during model load)
                         return True
                     else:
                         print("Cached model is incomplete, rebuilding...")
@@ -286,11 +283,8 @@ class CollaborativeFilteringRecommender:
         self.create_user_item_matrix()
         self.compute_similarity()
         
-        # Try to load content-based system (optional, won't fail if files don't exist)
-        try:
-            self._load_content_based_system()
-        except Exception:
-            pass  # Content-based is optional
+        # Content-based system will be loaded lazily when needed
+        # (not loaded here to avoid blocking during model load)
         
         # Save full model to cache
         if use_cache:
@@ -2123,12 +2117,21 @@ def main(user_id: int = 1, method: str = None):
         )
         
         # Load model (uses cache if available to skip retraining)
+        print("Loading model...")
         recommender.load_model(use_cache=True)
+        print("Model loaded successfully!")
         
-        # Check if user exists
-        if user_id not in recommender.user_ids:
+        # Check if user exists (use user_to_idx mapping which is more reliable)
+        if recommender.user_to_idx is None or user_id not in recommender.user_to_idx:
             print(f"\n⚠ Error: User {user_id} not found in the dataset.")
-            print(f"Available user IDs range from {recommender.user_ids.min()} to {recommender.user_ids.max()}")
+            if recommender.user_ids is not None and len(recommender.user_ids) > 0:
+                print(f"Available user IDs range from {recommender.user_ids.min()} to {recommender.user_ids.max()}")
+                print(f"Note: Only users who have rated movies released after 2015 are included.")
+                print(f"      User {user_id} may not have any ratings for movies after 2015.")
+                # Show some example user IDs that do exist
+                if len(recommender.user_ids) > 0:
+                    sample_ids = recommender.user_ids[:5] if len(recommender.user_ids) >= 5 else recommender.user_ids
+                    print(f"Example user IDs that exist: {', '.join(map(str, sample_ids))}")
             continue
         
         # Get recommendations for specified user
