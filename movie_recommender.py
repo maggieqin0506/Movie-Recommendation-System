@@ -1791,6 +1791,134 @@ class CollaborativeFilteringRecommender:
         }
         
         return all_metrics
+    
+    def evaluate_content_based(self, train_ratings: pd.DataFrame, test_ratings: pd.DataFrame,
+                              top_k: int = 10, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
+        """
+        Evaluate content-based recommendation quality using ranking metrics.
+        
+        Parameters:
+        -----------
+        train_ratings : pd.DataFrame
+            Training ratings DataFrame (used to build user profiles)
+        test_ratings : pd.DataFrame
+            Test ratings DataFrame (used to determine relevant movies)
+        top_k : int
+            Number of top recommendations to consider (default: 10)
+        threshold : float
+            Rating threshold to consider a movie as "relevant" (default: 4.0)
+        max_users : int
+            Maximum number of users to evaluate (default: 100)
+            
+        Returns:
+        --------
+        Dict[str, float]
+            Dictionary with precision, recall, f1, and ndcg metrics
+        """
+        # Load content-based system if not already loaded
+        if self.movie_embeddings is None:
+            try:
+                self._load_content_based_system()
+            except Exception as e:
+                print(f"  Error loading content-based system: {e}")
+                return {
+                    'precision@k': 0.0,
+                    'recall@k': 0.0,
+                    'f1@k': 0.0,
+                    'ndcg@k': 0.0,
+                    'n_users': 0
+                }
+        
+        user_precisions = []
+        user_recalls = []
+        user_ndcgs = []
+        
+        # Group test ratings by user
+        user_groups = list(test_ratings.groupby('userId'))
+        
+        # Limit number of users to evaluate
+        if len(user_groups) > max_users:
+            import random
+            random.seed(42)
+            user_groups = random.sample(user_groups, max_users)
+            print(f"  Sampling {max_users} users for content-based evaluation...")
+        
+        total = len(user_groups)
+        print(f"  Evaluating content-based recommendations for {total} users...")
+        
+        for idx, (user_id, user_test) in enumerate(user_groups, 1):
+            if idx % 10 == 0 or idx == total:
+                print(f"  Progress: {idx}/{total} ({100*idx/total:.1f}%)", end='\r')
+            
+            # Get relevant movies (highly rated in test set)
+            relevant_movies = set(
+                user_test[user_test['rating'] >= threshold]['movieId'].values
+            )
+            
+            if len(relevant_movies) == 0:
+                continue
+            
+            # Get user's training ratings to build profile
+            user_train = train_ratings[train_ratings['userId'] == user_id]
+            if len(user_train) == 0:
+                continue  # User has no training ratings, can't build profile
+            
+            # Check if user exists in current model (needed for recommend_movies_content_based)
+            if user_id not in self.user_to_idx:
+                continue
+            
+            try:
+                # Get content-based recommendations
+                # The method will use get_user_ratings which gets ratings from the model
+                # Since we built the model from training data, it will use training ratings
+                recommendations = self.recommend_movies_content_based(
+                    user_id, 
+                    n_recommendations=top_k,
+                    candidates=500
+                )
+                recommended_movies = set([rec[0] for rec in recommendations])
+                
+            except Exception as e:
+                # Skip if recommendation fails
+                continue
+            
+            # Calculate metrics
+            if len(recommended_movies) > 0:
+                # Precision@K: relevant items in recommendations / total recommendations
+                precision = len(relevant_movies & recommended_movies) / len(recommended_movies)
+                user_precisions.append(precision)
+                
+                # Recall@K: relevant items in recommendations / total relevant items
+                recall = len(relevant_movies & recommended_movies) / len(relevant_movies)
+                user_recalls.append(recall)
+                
+                # NDCG@K
+                ndcg = self._calculate_ndcg(recommendations, relevant_movies, top_k)
+                user_ndcgs.append(ndcg)
+        
+        print()  # New line after progress
+        
+        if len(user_precisions) == 0:
+            return {
+                'precision@k': 0.0,
+                'recall@k': 0.0,
+                'f1@k': 0.0,
+                'ndcg@k': 0.0,
+                'n_users': 0
+            }
+        
+        precision_avg = np.mean(user_precisions)
+        recall_avg = np.mean(user_recalls)
+        f1 = 2 * (precision_avg * recall_avg) / (precision_avg + recall_avg) if (precision_avg + recall_avg) > 0 else 0.0
+        ndcg_avg = np.mean(user_ndcgs)
+        
+        return {
+            'precision@k': precision_avg,
+            'recall@k': recall_avg,
+            'f1@k': f1,
+            'ndcg@k': ndcg_avg,
+            'n_users': len(user_precisions)
+        }
 
 
 def interactive_new_user_mode(recommender, show_both_cf=True):
@@ -2236,67 +2364,135 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
     Parameters:
     -----------
     method : str
-        'user' for user-based CF or 'item' for item-based CF
+        'user' for user-based CF, 'item' for item-based CF, or 'content' for content-based
     test_size : float
         Proportion of data to use for testing (default: 0.2)
     threshold : float
         Rating threshold to consider a movie as "relevant" (default: 4.0)
     """
-    method_name = "User-Based" if method == 'user' else "Item-Based"
-    print("=" * 60)
-    print(f"Model Evaluation - {method_name} Collaborative Filtering")
-    print("=" * 60)
-    
-    # Initialize recommender
-    recommender = CollaborativeFilteringRecommender(
-        ratings_file='ratings_full.csv',
-        movies_file='movies_clean.csv',
-        method=method
-    )
-    
-    # Load data
-    print("\nLoading data...")
-    recommender.load_data()
-    
-    # Split into train and test
-    print(f"\nSplitting data into train/test sets (test_size={test_size})...")
-    train_ratings, test_ratings = recommender.train_test_split(test_size=test_size)
-    
-    print(f"Training set: {len(train_ratings):,} ratings")
-    print(f"Test set: {len(test_ratings):,} ratings")
-    
-    # Use training data to build the model
-    print("\nBuilding model on training data...")
-    # Save original ratings
-    original_ratings = recommender.ratings_df.copy()
-    # Replace with training data
-    recommender.ratings_df = train_ratings
-    # Rebuild matrices with training data
-    recommender.create_user_item_matrix()
-    recommender.compute_similarity()
-    
-    # Evaluate on test set
-    print("\n" + "=" * 60)
-    print(f"Using relevance threshold: rating >= {threshold}")
-    metrics = recommender.evaluate_model(test_ratings, k=10, top_k=10, threshold=threshold)
-    
-    # Display results
-    print("\n" + "=" * 60)
-    print("Evaluation Results")
-    print("=" * 60)
-    print("\nRating Prediction Metrics:")
-    print(f"  RMSE (Root Mean Square Error): {metrics['rmse']:.4f}")
-    print(f"  MAE (Mean Absolute Error):     {metrics['mae']:.4f}")
-    print(f"  Number of predictions:         {metrics['n_samples']:,}")
-    
-    print("\nRanking Metrics (Top-10 Recommendations):")
-    print(f"  Precision@10: {metrics['precision@k']:.4f}")
-    print(f"  Recall@10:    {metrics['recall@k']:.4f}")
-    print(f"  F1@10:        {metrics['f1@k']:.4f}")
-    print(f"  NDCG@10:      {metrics['ndcg@k']:.4f}")
-    print(f"  Users evaluated: {metrics['n_users']:,}")
-    
-    print("=" * 60)
+    if method == 'content':
+        # Content-based evaluation
+        print("=" * 60)
+        print("Model Evaluation - Content-Based Filtering")
+        print("=" * 60)
+        
+        # Initialize recommender (method doesn't matter for content-based, but we need it for structure)
+        recommender = CollaborativeFilteringRecommender(
+            ratings_file='ratings_full.csv',
+            movies_file='movies_clean.csv',
+            method='user'  # Method doesn't affect content-based, but required for initialization
+        )
+        
+        # Load data
+        print("\nLoading data...")
+        recommender.load_data()
+        
+        # Split into train and test
+        print(f"\nSplitting data into train/test sets (test_size={test_size})...")
+        train_ratings, test_ratings = recommender.train_test_split(test_size=test_size)
+        
+        print(f"Training set: {len(train_ratings):,} ratings")
+        print(f"Test set: {len(test_ratings):,} ratings")
+        
+        # Build user-item matrix from training data (needed for get_user_ratings)
+        print("\nBuilding user-item matrix from training data...")
+        recommender.ratings_df = train_ratings
+        recommender.create_user_item_matrix()
+        
+        # Load content-based system
+        print("\nLoading content-based system...")
+        try:
+            recommender._load_content_based_system()
+        except Exception as e:
+            print(f"Error loading content-based system: {e}")
+            print("Please ensure movies_full.csv and movie_embeddings.npy exist.")
+            return
+        
+        # Evaluate content-based recommendations
+        print("\n" + "=" * 60)
+        print(f"Using relevance threshold: rating >= {threshold}")
+        print("\nEvaluating content-based recommendations...")
+        print("=" * 60)
+        
+        metrics = recommender.evaluate_content_based(
+            train_ratings=train_ratings,
+            test_ratings=test_ratings,
+            top_k=10,
+            threshold=threshold,
+            max_users=100
+        )
+        
+        # Display results
+        print("\n" + "=" * 60)
+        print("Content-Based Evaluation Results")
+        print("=" * 60)
+        print("\nRanking Metrics (Top-10 Recommendations):")
+        print(f"  Precision@10: {metrics['precision@k']:.4f}")
+        print(f"  Recall@10:    {metrics['recall@k']:.4f}")
+        print(f"  F1@10:        {metrics['f1@k']:.4f}")
+        print(f"  NDCG@10:      {metrics['ndcg@k']:.4f}")
+        print(f"  Users evaluated: {metrics['n_users']:,}")
+        print("\nNote: Content-based filtering does not predict ratings,")
+        print("      so only ranking metrics are available.")
+        print("=" * 60)
+        
+    else:
+        # Collaborative filtering evaluation (user-based or item-based)
+        method_name = "User-Based" if method == 'user' else "Item-Based"
+        print("=" * 60)
+        print(f"Model Evaluation - {method_name} Collaborative Filtering")
+        print("=" * 60)
+        
+        # Initialize recommender
+        recommender = CollaborativeFilteringRecommender(
+            ratings_file='ratings_full.csv',
+            movies_file='movies_clean.csv',
+            method=method
+        )
+        
+        # Load data
+        print("\nLoading data...")
+        recommender.load_data()
+        
+        # Split into train and test
+        print(f"\nSplitting data into train/test sets (test_size={test_size})...")
+        train_ratings, test_ratings = recommender.train_test_split(test_size=test_size)
+        
+        print(f"Training set: {len(train_ratings):,} ratings")
+        print(f"Test set: {len(test_ratings):,} ratings")
+        
+        # Use training data to build the model
+        print("\nBuilding model on training data...")
+        # Save original ratings
+        original_ratings = recommender.ratings_df.copy()
+        # Replace with training data
+        recommender.ratings_df = train_ratings
+        # Rebuild matrices with training data
+        recommender.create_user_item_matrix()
+        recommender.compute_similarity()
+        
+        # Evaluate on test set
+        print("\n" + "=" * 60)
+        print(f"Using relevance threshold: rating >= {threshold}")
+        metrics = recommender.evaluate_model(test_ratings, k=10, top_k=10, threshold=threshold)
+        
+        # Display results
+        print("\n" + "=" * 60)
+        print("Evaluation Results")
+        print("=" * 60)
+        print("\nRating Prediction Metrics:")
+        print(f"  RMSE (Root Mean Square Error): {metrics['rmse']:.4f}")
+        print(f"  MAE (Mean Absolute Error):     {metrics['mae']:.4f}")
+        print(f"  Number of predictions:         {metrics['n_samples']:,}")
+        
+        print("\nRanking Metrics (Top-10 Recommendations):")
+        print(f"  Precision@10: {metrics['precision@k']:.4f}")
+        print(f"  Recall@10:    {metrics['recall@k']:.4f}")
+        print(f"  F1@10:        {metrics['f1@k']:.4f}")
+        print(f"  NDCG@10:      {metrics['ndcg@k']:.4f}")
+        print(f"  Users evaluated: {metrics['n_users']:,}")
+        
+        print("=" * 60)
 
 
 def main_interactive(method: str = 'user', show_both_cf: bool = True):
@@ -2406,11 +2602,13 @@ Examples:
   # Run standard mode for a specific user
   python movie_recommender.py --user-id 42
   
-  # Evaluate the model
+  # Evaluate all methods (user-based CF, item-based CF, and content-based)
   python movie_recommender.py --evaluate
   
-  # Evaluate with item-based CF
+  # Evaluate specific method
+  python movie_recommender.py --evaluate --method user
   python movie_recommender.py --evaluate --method item
+  python movie_recommender.py --evaluate --method content
   
   # Run interactive mode with user-based CF (default)
   python movie_recommender.py --interactive
@@ -2441,9 +2639,9 @@ Examples:
     parser.add_argument(
         '--method', '-m',
         type=str,
-        choices=['user', 'item'],
+        choices=['user', 'item', 'content'],
         default=None,
-        help='Collaborative filtering method: "user" for user-based, "item" for item-based, or omit to show both'
+        help='Method: "user" for user-based CF, "item" for item-based CF, "content" for content-based. If omitted in evaluation mode, evaluates all methods.'
     )
     
     parser.add_argument(
@@ -2490,8 +2688,33 @@ Examples:
     # Check which mode to run
     if args.evaluate:
         # Evaluation mode
-        method = args.method if args.method else 'user'
-        main_evaluate(method=method, test_size=args.test_size, threshold=args.threshold)
+        if args.method:
+            # Evaluate specific method
+            main_evaluate(method=args.method, test_size=args.test_size, threshold=args.threshold)
+        else:
+            # Evaluate all methods: user-based CF, item-based CF, and content-based
+            print("=" * 60)
+            print("Comprehensive Model Evaluation - All Methods")
+            print("=" * 60)
+            print("\nEvaluating all recommendation methods...")
+            print("This will evaluate: User-Based CF, Item-Based CF, and Content-Based")
+            print("=" * 60)
+            
+            methods_to_evaluate = ['user', 'item', 'content']
+            
+            for idx, method in enumerate(methods_to_evaluate, 1):
+                print(f"\n\n{'=' * 60}")
+                print(f"[{idx}/{len(methods_to_evaluate)}] Evaluating {method.upper()}-based method...")
+                print("=" * 60)
+                main_evaluate(method=method, test_size=args.test_size, threshold=args.threshold)
+                
+                # Add spacing between methods (except after last one)
+                if idx < len(methods_to_evaluate):
+                    print("\n")
+            
+            print("\n" + "=" * 60)
+            print("Evaluation Complete - All Methods")
+            print("=" * 60)
     elif args.interactive:
         # Interactive mode
         method = args.method if args.method else 'user'
