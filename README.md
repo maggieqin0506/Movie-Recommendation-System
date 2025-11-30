@@ -342,9 +342,10 @@ python movie_recommender.py --evaluate --method item --test-size 0.3
 ```
 
 ## Notes
-
 - Ratings are clamped between 0.5 and 5.0
 - Only movies present in both ratings and movies datasets are considered
 - The system filters out movies the user has already rated
 - User-based CF generally works better for new users with few ratings
 - Item-based CF can be more stable but requires more user ratings
+- Initial Dataset Available: https://www.kaggle.com/datasets/aalichao/cmpe-279-datasets/settings
+- Modeling Dataset Available: https://www.kaggle.com/datasets/aalichao/modelingdataset/settings
