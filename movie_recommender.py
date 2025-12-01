@@ -2183,18 +2183,18 @@ def interactive_new_user_mode(recommender, show_both_cf=True):
     # Display Collaborative Filtering recommendations (primary method)
     if cf_recommendations_primary:
         method_name = "User-Based" if recommender.method == 'user' else "Item-Based"
-        print(f"\n🎬 Collaborative Filtering Recommendations ({method_name}):")
+        print(f"\n Collaborative Filtering Recommendations ({method_name}):")
         print("=" * 60)
         for i, (movie_id, title, pred_rating) in enumerate(cf_recommendations_primary, 1):
             print(f"{i:2d}. {title}")
             print(f"    Predicted Rating: {pred_rating:.2f}/5.0")
     else:
-        print("\n⚠ No collaborative filtering recommendations available.")
+        print("\n No collaborative filtering recommendations available.")
     
     # Display Collaborative Filtering recommendations (secondary method)
     if show_both_cf and cf_recommendations_secondary:
         other_method_name = "Item-Based" if recommender.method == 'user' else "User-Based"
-        print(f"\n🎬 Collaborative Filtering Recommendations ({other_method_name}):")
+        print(f"\n Collaborative Filtering Recommendations ({other_method_name}):")
         print("=" * 60)
         for i, (movie_id, title, pred_rating) in enumerate(cf_recommendations_secondary, 1):
             print(f"{i:2d}. {title}")
@@ -2202,13 +2202,13 @@ def interactive_new_user_mode(recommender, show_both_cf=True):
     
     # Display Content-Based recommendations
     if cb_recommendations:
-        print(f"\n🎬 Content-Based Recommendations:")
+        print(f"\n Content-Based Recommendations:")
         print("=" * 60)
         for i, (movie_id, title, sim_score) in enumerate(cb_recommendations, 1):
             print(f"{i:2d}. {title}")
             print(f"    Similarity Score: {sim_score:.3f}")
     else:
-        print("\n⚠ No content-based recommendations available.")
+        print("\n No content-based recommendations available.")
     
     print("\n" + "=" * 60)
     print("Thank you for using our recommendation system!")
