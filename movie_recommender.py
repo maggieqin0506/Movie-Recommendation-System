@@ -14,6 +14,7 @@ import re
 import pickle
 import os
 from pathlib import Path
+import matplotlib.pyplot as plt
 # Import content-based recommendation functions
 try:
     import importlib.util
@@ -2032,6 +2033,295 @@ class CollaborativeFilteringRecommender:
             }
         
         return results
+    
+    def evaluate_precision_recall_vs_k(self, test_ratings: pd.DataFrame, k: int = 10,
+                                       k_values: List[int] = None, threshold: float = 4.0,
+                                       max_users: int = 100) -> Dict[int, Dict[str, float]]:
+        """
+        Evaluate precision and recall for different top-k recommendation values.
+        
+        Parameters:
+        -----------
+        test_ratings : pd.DataFrame
+            DataFrame with columns: userId, movieId, rating
+        k : int
+            Number of neighbors to consider for prediction
+        k_values : List[int]
+            List of top-k values to evaluate (default: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        threshold : float
+            Rating threshold to consider a movie as "relevant" (default: 4.0)
+        max_users : int
+            Maximum number of users to evaluate (default: 100)
+            
+        Returns:
+        --------
+        Dict[int, Dict[str, float]]
+            Dictionary mapping k values to precision and recall metrics
+        """
+        if k_values is None:
+            k_values = list(range(1, 11))
+        
+        results = {}
+        
+        # Group test ratings by user
+        user_groups = list(test_ratings.groupby('userId'))
+        
+        # Limit number of users to evaluate
+        if len(user_groups) > max_users:
+            import random
+            random.seed(42)
+            user_groups = random.sample(user_groups, max_users)
+        
+        total = len(user_groups)
+        print(f"  Evaluating precision/recall vs k for {total} users...")
+        
+        # Pre-compute recommendations for all users (using max k)
+        max_k = max(k_values)
+        user_recommendations = {}
+        
+        for idx, (user_id, user_test) in enumerate(user_groups, 1):
+            if idx % 10 == 0 or idx == total:
+                print(f"  Progress: {idx}/{total} ({100*idx/total:.1f}%)", end='\r')
+            
+            if user_id not in self.user_ids:
+                continue
+            
+            # Get relevant movies (highly rated in test set)
+            relevant_movies = set(
+                user_test[user_test['rating'] >= threshold]['movieId'].values
+            )
+            
+            if len(relevant_movies) == 0:
+                continue
+            
+            # Get recommendations (up to max_k)
+            try:
+                recommendations = self.recommend_movies(user_id, n_recommendations=max_k, k=k)
+                recommended_movie_ids = [rec[0] for rec in recommendations]
+                user_recommendations[user_id] = {
+                    'recommendations': recommended_movie_ids,
+                    'relevant': relevant_movies
+                }
+            except:
+                continue
+        
+        print()  # New line after progress
+        
+        # Calculate metrics for each k value
+        for top_k in k_values:
+            user_precisions = []
+            user_recalls = []
+            
+            for user_id, data in user_recommendations.items():
+                recommended_movies = set(data['recommendations'][:top_k])
+                relevant_movies = data['relevant']
+                
+                if len(recommended_movies) > 0:
+                    # Precision@K: relevant items in recommendations / total recommendations
+                    precision = len(relevant_movies & recommended_movies) / len(recommended_movies)
+                    user_precisions.append(precision)
+                    
+                    # Recall@K: relevant items in recommendations / total relevant items
+                    recall = len(relevant_movies & recommended_movies) / len(relevant_movies)
+                    user_recalls.append(recall)
+            
+            if len(user_precisions) > 0:
+                results[top_k] = {
+                    'precision': np.mean(user_precisions),
+                    'recall': np.mean(user_recalls),
+                    'n_users': len(user_precisions)
+                }
+            else:
+                results[top_k] = {
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'n_users': 0
+                }
+        
+        return results
+    
+    def evaluate_content_based_precision_recall_vs_k(self, train_ratings: pd.DataFrame,
+                                                     test_ratings: pd.DataFrame,
+                                                     k_values: List[int] = None,
+                                                     threshold: float = 4.0,
+                                                     max_users: int = 100) -> Dict[int, Dict[str, float]]:
+        """
+        Evaluate precision and recall for different top-k recommendation values (content-based).
+        
+        Parameters:
+        -----------
+        train_ratings : pd.DataFrame
+            Training ratings DataFrame (used to build user profiles)
+        test_ratings : pd.DataFrame
+            Test ratings DataFrame (used to determine relevant movies)
+        k_values : List[int]
+            List of top-k values to evaluate (default: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        threshold : float
+            Rating threshold to consider a movie as "relevant" (default: 4.0)
+        max_users : int
+            Maximum number of users to evaluate (default: 100)
+            
+        Returns:
+        --------
+        Dict[int, Dict[str, float]]
+            Dictionary mapping k values to precision and recall metrics
+        """
+        if k_values is None:
+            k_values = list(range(1, 11))
+        
+        # Load content-based system if not already loaded
+        if self.movie_embeddings is None:
+            try:
+                self._load_content_based_system()
+            except Exception as e:
+                print(f"  Error loading content-based system: {e}")
+                return {k: {'precision': 0.0, 'recall': 0.0, 'n_users': 0} for k in k_values}
+        
+        results = {}
+        
+        # Group test ratings by user
+        user_groups = list(test_ratings.groupby('userId'))
+        
+        # Limit number of users to evaluate
+        if len(user_groups) > max_users:
+            import random
+            random.seed(42)
+            user_groups = random.sample(user_groups, max_users)
+        
+        total = len(user_groups)
+        print(f"  Evaluating content-based precision/recall vs k for {total} users...")
+        
+        # Pre-compute recommendations for all users (using max k)
+        max_k = max(k_values)
+        user_recommendations = {}
+        
+        for idx, (user_id, user_test) in enumerate(user_groups, 1):
+            if idx % 10 == 0 or idx == total:
+                print(f"  Progress: {idx}/{total} ({100*idx/total:.1f}%)", end='\r')
+            
+            # Get relevant movies (highly rated in test set)
+            relevant_movies = set(
+                user_test[user_test['rating'] >= threshold]['movieId'].values
+            )
+            
+            if len(relevant_movies) == 0:
+                continue
+            
+            # Get user's training ratings to build profile
+            user_train = train_ratings[train_ratings['userId'] == user_id]
+            if len(user_train) == 0:
+                continue  # User has no training ratings, can't build profile
+            
+            # Check if user exists in current model
+            if user_id not in self.user_to_idx:
+                continue
+            
+            try:
+                # Get content-based recommendations (up to max_k)
+                recommendations = self.recommend_movies_content_based(
+                    user_id, 
+                    n_recommendations=max_k,
+                    candidates=500
+                )
+                recommended_movie_ids = [rec[0] for rec in recommendations]
+                user_recommendations[user_id] = {
+                    'recommendations': recommended_movie_ids,
+                    'relevant': relevant_movies
+                }
+            except Exception as e:
+                continue
+        
+        print()  # New line after progress
+        
+        # Calculate metrics for each k value
+        for top_k in k_values:
+            user_precisions = []
+            user_recalls = []
+            
+            for user_id, data in user_recommendations.items():
+                recommended_movies = set(data['recommendations'][:top_k])
+                relevant_movies = data['relevant']
+                
+                if len(recommended_movies) > 0:
+                    # Precision@K: relevant items in recommendations / total recommendations
+                    precision = len(relevant_movies & recommended_movies) / len(recommended_movies)
+                    user_precisions.append(precision)
+                    
+                    # Recall@K: relevant items in recommendations / total relevant items
+                    recall = len(relevant_movies & recommended_movies) / len(relevant_movies)
+                    user_recalls.append(recall)
+            
+            if len(user_precisions) > 0:
+                results[top_k] = {
+                    'precision': np.mean(user_precisions),
+                    'recall': np.mean(user_recalls),
+                    'n_users': len(user_precisions)
+                }
+            else:
+                results[top_k] = {
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'n_users': 0
+                }
+        
+        return results
+
+
+def plot_precision_recall_vs_k(results_dict: Dict[str, Dict[int, Dict[str, float]]],
+                               save_path: str = None, show_plot: bool = True):
+    """
+    Plot precision and recall vs k for different recommendation methods.
+    
+    Parameters:
+    -----------
+    results_dict : Dict[str, Dict[int, Dict[str, float]]]
+        Dictionary mapping method names to k-value results
+        Format: {'method_name': {k: {'precision': float, 'recall': float}}}
+    save_path : str, optional
+        Path to save the plot (default: None, don't save)
+    show_plot : bool
+        Whether to display the plot (default: True)
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    k_values = sorted(list(results_dict[list(results_dict.keys())[0]].keys()))
+    
+    # Plot precision
+    for method_name, results in results_dict.items():
+        precisions = [results[k]['precision'] for k in k_values]
+        ax1.plot(k_values, precisions, marker='o', label=method_name, linewidth=2, markersize=6)
+    
+    ax1.set_xlabel('Number of Recommendations (k)', fontsize=12)
+    ax1.set_ylabel('Precision@k', fontsize=12)
+    ax1.set_title('Precision vs Number of Recommendations', fontsize=14, fontweight='bold')
+    ax1.set_xticks(k_values)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=10)
+    ax1.set_ylim(bottom=0)
+    
+    # Plot recall
+    for method_name, results in results_dict.items():
+        recalls = [results[k]['recall'] for k in k_values]
+        ax2.plot(k_values, recalls, marker='s', label=method_name, linewidth=2, markersize=6)
+    
+    ax2.set_xlabel('Number of Recommendations (k)', fontsize=12)
+    ax2.set_ylabel('Recall@k', fontsize=12)
+    ax2.set_title('Recall vs Number of Recommendations', fontsize=14, fontweight='bold')
+    ax2.set_xticks(k_values)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=10)
+    ax2.set_ylim(bottom=0)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"\nPlot saved to {save_path}")
+    
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
 
 
 def interactive_new_user_mode(recommender, show_both_cf=True):
@@ -2660,6 +2950,163 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
         print("=" * 60)
 
 
+def evaluate_and_plot_precision_recall_vs_k(test_size: float = 0.2, threshold: float = 4.0,
+                                            max_users: int = 100, save_path: str = None,
+                                            show_plot: bool = True):
+    """
+    Evaluate precision and recall vs k for all recommendation methods and create plots.
+    
+    Parameters:
+    -----------
+    test_size : float
+        Proportion of data to use for testing (default: 0.2)
+    threshold : float
+        Rating threshold to consider a movie as "relevant" (default: 4.0)
+    max_users : int
+        Maximum number of users to evaluate (default: 100)
+    save_path : str, optional
+        Path to save the plot (default: None, don't save)
+    show_plot : bool
+        Whether to display the plot (default: True)
+    """
+    print("=" * 60)
+    print("Precision and Recall vs Number of Recommendations (k)")
+    print("Evaluating all methods: User-Based CF, Item-Based CF, Content-Based")
+    print("=" * 60)
+    
+    # Initialize recommenders
+    user_recommender = CollaborativeFilteringRecommender(
+        ratings_file='ratings_full.csv',
+        movies_file='movies_clean.csv',
+        method='user'
+    )
+    
+    item_recommender = CollaborativeFilteringRecommender(
+        ratings_file='ratings_full.csv',
+        movies_file='movies_clean.csv',
+        method='item'
+    )
+    
+    content_recommender = CollaborativeFilteringRecommender(
+        ratings_file='ratings_full.csv',
+        movies_file='movies_clean.csv',
+        method='user'  # Method doesn't matter for content-based
+    )
+    
+    # Load data for all recommenders
+    print("\nLoading data...")
+    user_recommender.load_data()
+    item_recommender.load_data()
+    content_recommender.load_data()
+    
+    # Split into train and test (use same split for all methods)
+    print(f"\nSplitting data into train/test sets (test_size={test_size})...")
+    train_ratings, test_ratings = user_recommender.train_test_split(test_size=test_size)
+    
+    print(f"Training set: {len(train_ratings):,} ratings")
+    print(f"Test set: {len(test_ratings):,} ratings")
+    
+    # Build models on training data
+    print("\nBuilding models on training data...")
+    
+    # User-based CF
+    print("  - Building user-based CF model...")
+    user_recommender.ratings_df = train_ratings
+    user_recommender.create_user_item_matrix()
+    user_recommender.compute_similarity()
+    
+    # Item-based CF
+    print("  - Building item-based CF model...")
+    item_recommender.ratings_df = train_ratings
+    item_recommender.create_user_item_matrix()
+    item_recommender.compute_similarity()
+    
+    # Content-based
+    print("  - Building content-based model...")
+    content_recommender.ratings_df = train_ratings
+    content_recommender.create_user_item_matrix()
+    try:
+        content_recommender._load_content_based_system()
+    except Exception as e:
+        print(f"  Error loading content-based system: {e}")
+        print("  Skipping content-based evaluation.")
+        content_recommender = None
+    
+    # Evaluate all methods
+    results_dict = {}
+    
+    # User-based CF
+    print("\n" + "=" * 60)
+    print("Evaluating User-Based Collaborative Filtering...")
+    print("=" * 60)
+    user_results = user_recommender.evaluate_precision_recall_vs_k(
+        test_ratings=test_ratings,
+        k=10,
+        k_values=list(range(1, 11)),
+        threshold=threshold,
+        max_users=max_users
+    )
+    results_dict['User-Based CF'] = user_results
+    
+    # Item-based CF
+    print("\n" + "=" * 60)
+    print("Evaluating Item-Based Collaborative Filtering...")
+    print("=" * 60)
+    item_results = item_recommender.evaluate_precision_recall_vs_k(
+        test_ratings=test_ratings,
+        k=10,
+        k_values=list(range(1, 11)),
+        threshold=threshold,
+        max_users=max_users
+    )
+    results_dict['Item-Based CF'] = item_results
+    
+    # Content-based
+    if content_recommender is not None:
+        print("\n" + "=" * 60)
+        print("Evaluating Content-Based Filtering...")
+        print("=" * 60)
+        content_results = content_recommender.evaluate_content_based_precision_recall_vs_k(
+            train_ratings=train_ratings,
+            test_ratings=test_ratings,
+            k_values=list(range(1, 11)),
+            threshold=threshold,
+            max_users=max_users
+        )
+        results_dict['Content-Based'] = content_results
+    
+    # Create and display plot
+    print("\n" + "=" * 60)
+    print("Generating precision and recall vs k plots...")
+    print("=" * 60)
+    plot_precision_recall_vs_k(results_dict, save_path=save_path, show_plot=show_plot)
+    
+    # Print summary table
+    print("\n" + "=" * 60)
+    print("Summary: Precision and Recall by k")
+    print("=" * 60)
+    print(f"\n{'k':<5} {'User-Based CF':<20} {'Item-Based CF':<20} {'Content-Based':<20}")
+    print(f"{'':5} {'Prec':<10} {'Rec':<10} {'Prec':<10} {'Rec':<10} {'Prec':<10} {'Rec':<10}")
+    print("-" * 75)
+    
+    for k in range(1, 11):
+        user_prec = results_dict['User-Based CF'][k]['precision']
+        user_rec = results_dict['User-Based CF'][k]['recall']
+        item_prec = results_dict['Item-Based CF'][k]['precision']
+        item_rec = results_dict['Item-Based CF'][k]['recall']
+        
+        line = f"{k:<5} {user_prec:<10.4f} {user_rec:<10.4f} {item_prec:<10.4f} {item_rec:<10.4f}"
+        
+        if 'Content-Based' in results_dict:
+            cb_prec = results_dict['Content-Based'][k]['precision']
+            cb_rec = results_dict['Content-Based'][k]['recall']
+            line += f" {cb_prec:<10.4f} {cb_rec:<10.4f}"
+        
+        print(line)
+    
+    print("=" * 60)
+
+
 def main_interactive(method: str = 'user', show_both_cf: bool = True):
     """
     Interactive mode for new users.
@@ -2786,6 +3233,12 @@ Examples:
   
   # Clear cache for specific method
   python movie_recommender.py --clear-cache --method user
+  
+  # Generate precision/recall vs k plots for all methods
+  python movie_recommender.py --plot
+  
+  # Generate and save precision/recall plot
+  python movie_recommender.py --plot --save-plot precision_recall.png
         """
     )
     
@@ -2839,6 +3292,20 @@ Examples:
         help='Clear all cached model files and exit'
     )
     
+    parser.add_argument(
+        '--plot',
+        action='store_true',
+        help='Generate precision and recall vs k plots for all methods (k=1 to 10)'
+    )
+    
+    parser.add_argument(
+        '--save-plot',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='Path to save the precision/recall plot (e.g., "precision_recall.png")'
+    )
+    
     args = parser.parse_args()
     
     # Handle cache clearing
@@ -2851,7 +3318,16 @@ Examples:
         sys.exit(0)
     
     # Check which mode to run
-    if args.evaluate:
+    if args.plot:
+        # Plot precision/recall vs k for all methods
+        evaluate_and_plot_precision_recall_vs_k(
+            test_size=args.test_size,
+            threshold=args.threshold,
+            max_users=100,
+            save_path=args.save_plot,
+            show_plot=True
+        )
+    elif args.evaluate:
         # Evaluation mode
         if args.method:
             # Evaluate specific method
