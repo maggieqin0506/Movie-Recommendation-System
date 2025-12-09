@@ -971,8 +971,6 @@ class CollaborativeFilteringRecommender:
         else:
             unrated_candidates = list(unrated_candidates)
         
-        print(f"Evaluating {len(unrated_candidates):,} movies you haven't rated yet...")
-        
         # Predict ratings for candidate movies
         predictions = []
         
@@ -1504,7 +1502,7 @@ class CollaborativeFilteringRecommender:
         }
     
     def evaluate_ranking(self, test_ratings: pd.DataFrame, k: int = 10, 
-                        top_k: int = 10, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
+                        top_k: int = 1, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
         """
         Evaluate ranking quality using Precision@K, Recall@K, F1@K, and NDCG@K.
         
@@ -1748,7 +1746,7 @@ class CollaborativeFilteringRecommender:
         return train_ratings, test_ratings
     
     def evaluate_model(self, test_ratings: pd.DataFrame, k: int = 10, 
-                      top_k: int = 10, threshold: float = 4.0,
+                      top_k: int = 1, threshold: float = 4.0,
                       max_samples: int = 10000, max_users: int = 100) -> Dict[str, float]:
         """
         Comprehensive model evaluation combining rating prediction and ranking metrics.
@@ -1793,7 +1791,7 @@ class CollaborativeFilteringRecommender:
         return all_metrics
     
     def evaluate_content_based(self, train_ratings: pd.DataFrame, test_ratings: pd.DataFrame,
-                              top_k: int = 10, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
+                              top_k: int = 1, threshold: float = 4.0, max_users: int = 100) -> Dict[str, float]:
         """
         Evaluate content-based recommendation quality using ranking metrics.
         
@@ -1919,6 +1917,121 @@ class CollaborativeFilteringRecommender:
             'ndcg@k': ndcg_avg,
             'n_users': len(user_precisions)
         }
+    
+    def evaluate_thresholds(self, test_ratings: pd.DataFrame, k: int = 10, 
+                           top_k: int = 1, max_users: int = 100,
+                           threshold_min: float = 0.0, threshold_max: float = 5.0, 
+                           threshold_step: float = 0.5) -> Dict[float, Dict[str, float]]:
+        """
+        Evaluate ranking metrics across multiple relevance thresholds.
+        
+        Parameters:
+        -----------
+        test_ratings : pd.DataFrame
+            DataFrame with columns: userId, movieId, rating
+        k : int
+            Number of neighbors to consider for prediction
+        top_k : int
+            Number of top recommendations to consider
+        max_users : int
+            Maximum number of users to evaluate (default: 100)
+        threshold_min : float
+            Minimum threshold value (default: 0.0)
+        threshold_max : float
+            Maximum threshold value (default: 5.0)
+        threshold_step : float
+            Step size for threshold values (default: 0.5)
+            
+        Returns:
+        --------
+        Dict[float, Dict[str, float]]
+            Dictionary mapping threshold values to their metrics (precision, recall, f1)
+        """
+        thresholds = np.arange(threshold_min, threshold_max + threshold_step, threshold_step)
+        results = {}
+        
+        print(f"\nEvaluating across {len(thresholds)} thresholds: {threshold_min} to {threshold_max} (step {threshold_step})")
+        print("=" * 60)
+        
+        for threshold in thresholds:
+            threshold = round(threshold, 1)  # Round to avoid floating point issues
+            print(f"\nEvaluating with threshold >= {threshold:.1f}...")
+            
+            # Evaluate ranking metrics for this threshold
+            ranking_metrics = self.evaluate_ranking(
+                test_ratings, 
+                k=k, 
+                top_k=top_k, 
+                threshold=threshold, 
+                max_users=max_users
+            )
+            
+            results[threshold] = {
+                'precision@k': ranking_metrics['precision@k'],
+                'recall@k': ranking_metrics['recall@k'],
+                'f1@k': ranking_metrics['f1@k'],
+                'n_users': ranking_metrics['n_users']
+            }
+        
+        return results
+    
+    def evaluate_content_based_thresholds(self, train_ratings: pd.DataFrame, 
+                                          test_ratings: pd.DataFrame,
+                                          top_k: int = 1, max_users: int = 100,
+                                          threshold_min: float = 0.0, threshold_max: float = 5.0, 
+                                          threshold_step: float = 0.5) -> Dict[float, Dict[str, float]]:
+        """
+        Evaluate content-based recommendations across multiple relevance thresholds.
+        
+        Parameters:
+        -----------
+        train_ratings : pd.DataFrame
+            Training ratings DataFrame (used to build user profiles)
+        test_ratings : pd.DataFrame
+            Test ratings DataFrame (used to determine relevant movies)
+        top_k : int
+            Number of top recommendations to consider (default: 10)
+        max_users : int
+            Maximum number of users to evaluate (default: 100)
+        threshold_min : float
+            Minimum threshold value (default: 0.0)
+        threshold_max : float
+            Maximum threshold value (default: 5.0)
+        threshold_step : float
+            Step size for threshold values (default: 0.5)
+            
+        Returns:
+        --------
+        Dict[float, Dict[str, float]]
+            Dictionary mapping threshold values to their metrics (precision, recall, f1)
+        """
+        thresholds = np.arange(threshold_min, threshold_max + threshold_step, threshold_step)
+        results = {}
+        
+        print(f"\nEvaluating across {len(thresholds)} thresholds: {threshold_min} to {threshold_max} (step {threshold_step})")
+        print("=" * 60)
+        
+        for threshold in thresholds:
+            threshold = round(threshold, 1)  # Round to avoid floating point issues
+            print(f"\nEvaluating with threshold >= {threshold:.1f}...")
+            
+            # Evaluate content-based metrics for this threshold
+            metrics = self.evaluate_content_based(
+                train_ratings=train_ratings,
+                test_ratings=test_ratings,
+                top_k=top_k,
+                threshold=threshold,
+                max_users=max_users
+            )
+            
+            results[threshold] = {
+                'precision@k': metrics['precision@k'],
+                'recall@k': metrics['recall@k'],
+                'f1@k': metrics['f1@k'],
+                'n_users': metrics['n_users']
+            }
+        
+        return results
 
 
 def interactive_new_user_mode(recommender, show_both_cf=True):
@@ -2417,7 +2530,7 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
         metrics = recommender.evaluate_content_based(
             train_ratings=train_ratings,
             test_ratings=test_ratings,
-            top_k=10,
+            top_k=1,
             threshold=threshold,
             max_users=100
         )
@@ -2426,14 +2539,40 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
         print("\n" + "=" * 60)
         print("Content-Based Evaluation Results")
         print("=" * 60)
-        print("\nRanking Metrics (Top-10 Recommendations):")
-        print(f"  Precision@10: {metrics['precision@k']:.4f}")
-        print(f"  Recall@10:    {metrics['recall@k']:.4f}")
-        print(f"  F1@10:        {metrics['f1@k']:.4f}")
-        print(f"  NDCG@10:      {metrics['ndcg@k']:.4f}")
+        print("\nRanking Metrics (Top-1 Recommendations):")
+        print(f"  Precision@1: {metrics['precision@k']:.4f}")
+        print(f"  Recall@1:    {metrics['recall@k']:.4f}")
+        print(f"  F1@1:        {metrics['f1@k']:.4f}")
+        print(f"  NDCG@1:      {metrics['ndcg@k']:.4f}")
         print(f"  Users evaluated: {metrics['n_users']:,}")
         print("\nNote: Content-based filtering does not predict ratings,")
         print("      so only ranking metrics are available.")
+        print("=" * 60)
+        
+        # Evaluate across multiple thresholds
+        print("\n" + "=" * 60)
+        print("Threshold Analysis (0.0 to 5.0, step 0.5)")
+        print("=" * 60)
+        threshold_results = recommender.evaluate_content_based_thresholds(
+            train_ratings=train_ratings,
+            test_ratings=test_ratings,
+            top_k=1,
+            max_users=100,
+            threshold_min=0.0,
+            threshold_max=5.0,
+            threshold_step=0.5
+        )
+        
+        # Display threshold results
+        print("\n" + "=" * 60)
+        print("Threshold Analysis Results")
+        print("=" * 60)
+        print(f"\n{'Threshold':<12} {'Precision@1':<15} {'Recall@1':<15} {'F1@1':<15} {'Users':<10}")
+        print("-" * 70)
+        for threshold in sorted(threshold_results.keys()):
+            metrics = threshold_results[threshold]
+            print(f"{threshold:<12.1f} {metrics['precision@k']:<15.4f} {metrics['recall@k']:<15.4f} "
+                  f"{metrics['f1@k']:<15.4f} {metrics['n_users']:<10}")
         print("=" * 60)
         
     else:
@@ -2474,7 +2613,7 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
         # Evaluate on test set
         print("\n" + "=" * 60)
         print(f"Using relevance threshold: rating >= {threshold}")
-        metrics = recommender.evaluate_model(test_ratings, k=10, top_k=10, threshold=threshold)
+        metrics = recommender.evaluate_model(test_ratings, k=10, top_k=1, threshold=threshold)
         
         # Display results
         print("\n" + "=" * 60)
@@ -2485,13 +2624,39 @@ def main_evaluate(method: str = 'user', test_size: float = 0.2, threshold: float
         print(f"  MAE (Mean Absolute Error):     {metrics['mae']:.4f}")
         print(f"  Number of predictions:         {metrics['n_samples']:,}")
         
-        print("\nRanking Metrics (Top-10 Recommendations):")
-        print(f"  Precision@10: {metrics['precision@k']:.4f}")
-        print(f"  Recall@10:    {metrics['recall@k']:.4f}")
-        print(f"  F1@10:        {metrics['f1@k']:.4f}")
-        print(f"  NDCG@10:      {metrics['ndcg@k']:.4f}")
+        print("\nRanking Metrics (Top-1 Recommendations):")
+        print(f"  Precision@1: {metrics['precision@k']:.4f}")
+        print(f"  Recall@1:    {metrics['recall@k']:.4f}")
+        print(f"  F1@1:        {metrics['f1@k']:.4f}")
+        print(f"  NDCG@1:      {metrics['ndcg@k']:.4f}")
         print(f"  Users evaluated: {metrics['n_users']:,}")
         
+        print("=" * 60)
+        
+        # Evaluate across multiple thresholds
+        print("\n" + "=" * 60)
+        print("Threshold Analysis (0.0 to 5.0, step 0.5)")
+        print("=" * 60)
+        threshold_results = recommender.evaluate_thresholds(
+            test_ratings=test_ratings,
+            k=10,
+            top_k=1,
+            max_users=100,
+            threshold_min=0.0,
+            threshold_max=5.0,
+            threshold_step=0.5
+        )
+        
+        # Display threshold results
+        print("\n" + "=" * 60)
+        print("Threshold Analysis Results")
+        print("=" * 60)
+        print(f"\n{'Threshold':<12} {'Precision@1':<15} {'Recall@1':<15} {'F1@1':<15} {'Users':<10}")
+        print("-" * 70)
+        for threshold in sorted(threshold_results.keys()):
+            metrics = threshold_results[threshold]
+            print(f"{threshold:<12.1f} {metrics['precision@k']:<15.4f} {metrics['recall@k']:<15.4f} "
+                  f"{metrics['f1@k']:<15.4f} {metrics['n_users']:<10}")
         print("=" * 60)
 
 
