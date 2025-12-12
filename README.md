@@ -15,6 +15,19 @@ A comprehensive movie recommendation system that supports multiple recommendatio
 - **Caching System**: Automatically caches models to skip retraining on subsequent runs
 - **Comprehensive**: Uses full dataset for best recommendation quality
 
+## Code Structure
+
+The codebase is organized into modular components:
+
+- **`movie_recommender.py`**: Main entry point providing backward compatibility and the `main()` function for standard recommendation mode
+- **`collaborative_filtering.py`**: Core implementation of collaborative filtering algorithms (user-based and item-based CF), including similarity computation, rating prediction, and recommendation generation
+- **`content-based.py`**: Content-based filtering implementation using movie embeddings and approximate nearest neighbors (ANN) for recommendations based on movie features
+- **`cli.py`**: Command-line interface that parses arguments and routes to appropriate modes (standard, interactive, evaluation)
+- **`interactive.py`**: Interactive mode implementation for new users to rate movies and receive personalized recommendations
+- **`evaluation_runners.py`**: Evaluation framework for computing metrics (RMSE, MAE, Precision@K, Recall@K, NDCG@K) and running model assessments
+- **`plotting.py`**: Visualization utilities for generating precision/recall plots and other evaluation charts
+- **`cache_utils.py`**: Caching utilities for persisting trained models to disk and loading them for faster subsequent runs
+
 ## Installation
 
 ### Using Virtual Environment (Recommended)
